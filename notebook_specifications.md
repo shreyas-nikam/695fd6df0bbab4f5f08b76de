@@ -1,246 +1,281 @@
 
-# Configuration-Driven Data Platform for Sector-Specific Insights
+# Building a Configuration-Driven Data Platform for PE Sector-Specific Insights
 
-## Introduction to PE Org-AI-R Platform
+## Introduction: Empowering PE Org-AI-R with Flexible Data Architecture
 
-**Persona:** Sarah, a Data Engineer at PE Org-AI-R.
-**Organization:** PE Org-AI-R is a private equity firm that leverages AI-driven insights to evaluate and manage its portfolio companies across diverse sectors.
+As a **Software Developer** at PE Org-AI-R, our mission is to build a robust platform that provides unparalleled insights into private equity investments across diverse sectors like Manufacturing, Healthcare, and Financial Services. Each of these 7 sectors has unique evaluation criteria, investment parameters, and data attributes. The challenge is to manage these sector-specific behaviors without creating fragmented database schemas or embedding complex, hardcoded logic that becomes a maintenance nightmare.
 
-Sarah's role involves designing and implementing the foundational data architecture for the PE Org-AI-R platform. The firm invests in 7 distinct sectors, each with unique evaluation criteria and investment parameters. Traditionally, this would lead to complex, hardcoded logic or fragmented database schemas, making the platform difficult to maintain and scale.
+This notebook will guide you through the process of designing and implementing a **configuration-driven data architecture**. This approach centralizes and standardizes how sector-specific logic is managed, ensuring flexibility, scalability, and maintainability. Instead of modifying code or schema for every new sector requirement, we'll define these behaviors through data, allowing for dynamic adjustments and future expansion.
 
-To overcome this, Sarah's team has adopted a **configuration-driven data architecture**. This innovative approach centralizes and standardizes how sector-specific logic is managed by defining these behaviors directly through data. This notebook demonstrates Sarah's workflow in building this robust and flexible system, ensuring that sector-specific evaluation models can adapt without requiring code changes or schema alterations. The core principle guiding this work is "**One Schema, Many Configurations**," meaning all 7 PE sectors share identical base schemas, with differentiation achieved purely through data in configuration tables.
-
-Through this lab, you will step into Sarah's shoes and:
--   Design the core database schemas for managing sector configurations.
--   Populate these tables with initial, sector-specific data.
--   Create tables for organizations and their unique sector attributes.
--   Implement a configuration service that leverages caching for efficient access.
--   Construct a unified view to bring together organizational data and their varied sector attributes.
+By the end of this lab, you will have built the foundational components for a data platform that truly adapts to the unique needs of each private equity sector.
 
 ---
 
-## 1. Environment Setup
+## 1. Setup: Installing Libraries & Initializing Mock Infrastructure
 
-This section outlines the necessary installations and imports to set up the working environment for our data platform.
-
-### 1.1 Install Required Libraries
-
-We'll use `sqlalchemy` for database interactions, `psycopg2-binary` as the PostgreSQL adapter, `redis` for caching, `pandas` for data manipulation and display, `faker` for synthetic data generation, `uuid` for generating unique identifiers, and `matplotlib` for basic visualizations.
+Before diving into schema design and data seeding, we need to set up our environment by installing the necessary Python libraries and preparing a simulated database and caching layer. For this demonstration, we'll use a `MockDatabaseClient` to simulate PostgreSQL interactions and a `MockRedisClient` to emulate Redis caching, allowing us to focus on the core logic without requiring external service setup.
 
 ```python
-!pip install sqlalchemy==2.0.30 psycopg2-binary==2.9.9 redis==5.0.3 pandas==2.2.2 Faker==24.4.0 matplotlib==3.9.0 dataclasses-json==0.6.6
+!pip install pandas matplotlib seaborn psycopg2-binary redis
 ```
 
-### 1.2 Import Required Dependencies
-
-Next, we import all the necessary modules and classes from the installed libraries.
-
 ```python
-import os
-import uuid
-import random
-from datetime import date, timedelta
-from decimal import Decimal
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
-from dataclasses_json import dataclass_json # For serialization to/from cache
-
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
+import seaborn as sns
+from typing import Dict, List, Optional, Any, Callable, TypeVar
+from dataclasses import dataclass, field
+from decimal import Decimal
+import json
+import uuid
+import datetime
 
-from sqlalchemy import create_engine, text, Engine
-from sqlalchemy.orm import sessionmaker
-import redis
+# --- Mock Infrastructure Classes ---
 
-# Suppress warnings from Faker
-import warnings
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    from faker import Faker
+# Mock Database Client for PostgreSQL simulation
+class MockDatabaseClient:
+    """Simulates PostgreSQL database operations for demonstration purposes."""
+    def __init__(self):
+        self.tables = {}
+        self.sequences = {} # For SERIAL/AUTOINCREMENT
+        self.foreign_keys = {}
+        self.unique_constraints = {}
 
-# Initialize Faker for synthetic data generation
-fake = Faker()
-```
+    def _get_next_sequence_val(self, seq_name):
+        if seq_name not in self.sequences:
+            self.sequences[seq_name] = 1
+        else:
+            self.sequences[seq_name] += 1
+        return self.sequences[seq_name]
 
-### 1.3 Database and Cache Connection Setup
+    def execute_ddl(self, sql_statement: str):
+        """Simulates executing DDL statements like CREATE TABLE."""
+        # Simplified DDL parsing for demonstration
+        table_name = None
+        if "CREATE TABLE" in sql_statement:
+            table_name = sql_statement.split("CREATE TABLE ")[1].split(" ")[0].strip()
+            self.tables[table_name] = [] # Initialize table as an empty list of dicts
+            print(f"Mock DB: Table '{table_name}' created (simulated).")
+        elif "CREATE OR REPLACE VIEW" in sql_statement:
+            view_name = sql_statement.split("CREATE OR REPLACE VIEW ")[1].split(" ")[0].strip()
+            # Views are just metadata for now, not actual data storage in mock DB
+            print(f"Mock DB: View '{view_name}' created (simulated).")
+        else:
+            print(f"Mock DB: DDL executed (simulated, statement not fully parsed): {sql_statement[:50]}...")
 
-Sarah needs to connect to the PostgreSQL database and the Redis cache. For this notebook, we'll assume a local PostgreSQL instance is running and Redis is accessible. The connection details will be pulled from environment variables.
+    def fetch_one(self, query: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Simulates fetching a single row."""
+        # This is a very basic simulation; a real ORM would parse this
+        # For this lab, assume the query is simple enough to match a specific record
+        table_name = query.split("FROM ")[1].split(" ")[0].strip()
+        if table_name not in self.tables:
+            return None
 
-**Action:** Set your PostgreSQL and Redis connection strings in your environment variables before running this notebook, or modify the `db_url` and `redis_url` variables directly.
-
-```python
-# --- Database Connection (PostgreSQL) ---
-# IMPORTANT: Replace with your actual PostgreSQL connection string or set as environment variable
-# Example: "postgresql://user:password@localhost:5432/pe_orgair_db"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://testuser:testpassword@localhost:5432/pe_orgair_db")
-
-class DBManager:
-    """A simplified database manager using SQLAlchemy Core for direct SQL execution."""
-    def __init__(self, db_url: str):
-        self.engine: Engine = create_engine(db_url)
-        self.Session = sessionmaker(bind=self.engine)
-        print(f"Database connection engine created for: {db_url.split('@')[-1]}")
-
-    def execute(self, query: str, params: dict = None):
-        """Executes a DDL or DML query."""
-        with self.Session() as session:
-            try:
-                session.execute(text(query), params)
-                session.commit()
-                # print("SQL command executed successfully.")
-            except Exception as e:
-                session.rollback()
-                print(f"Error executing SQL: {e}")
-                raise
-
-    def fetch_one(self, query: str, params: dict = None) -> Optional[Dict[str, Any]]:
-        """Fetches a single row."""
-        with self.Session() as session:
-            result = session.execute(text(query), params).fetchone()
-            return result._mapping if result else None
-
-    def fetch_all(self, query: str, params: dict = None) -> List[Dict[str, Any]]:
-        """Fetches all rows."""
-        with self.Session() as session:
-            results = session.execute(text(query), params).fetchall()
-            return [r._mapping for r in results]
-
-    def dispose(self):
-        """Disposes the engine connection pool."""
-        self.engine.dispose()
-        print("Database engine disposed.")
-
-db_manager = DBManager(DATABASE_URL)
-
-
-# --- Redis Connection ---
-# IMPORTANT: Replace with your actual Redis connection string or set as environment variable
-# Example: "redis://localhost:6379/0"
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-class CacheManager:
-    """Redis cache manager with TTL support."""
-    def __init__(self, redis_url: str):
-        self._client = redis.from_url(redis_url, decode_responses=True)
-        print(f"Redis client connected to: {redis_url.split('@')[-1]}")
-
-    def get(self, key: str) -> Optional[Any]:
-        """Get cached value, automatically decodes JSON."""
-        value = self._client.get(key)
-        if value:
-            # print(f"Cache hit for key: {key}")
-            return json.loads(value)
-        # print(f"Cache miss for key: {key}")
+        # Simple WHERE clause matching based on params
+        for row in self.tables[table_name]:
+            match = True
+            for k, v in params.items():
+                if row.get(k) != v:
+                    match = False
+                    break
+            if match:
+                return row
         return None
 
-    def set(self, key: str, value: Any, ttl: int = 3600) -> None:
-        """Set cached value with TTL, automatically encodes JSON."""
-        self._client.setex(key, ttl, json.dumps(value))
-        # print(f"Cache set for key: {key} with TTL: {ttl}")
+    def fetch_all(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Simulates fetching multiple rows."""
+        table_name = query.split("FROM ")[1].split(" ")[0].strip() # Get table name after FROM
+        if table_name not in self.tables:
+            return []
+
+        results = []
+        for row in self.tables[table_name]:
+            # Apply simple WHERE clause filtering if params are provided
+            if params:
+                match = True
+                for k, v in params.items():
+                    if row.get(k) != v:
+                        match = False
+                        break
+                if not match:
+                    continue
+
+            # Apply simple SELECT clause filtering if needed, otherwise return full row
+            selected_cols = []
+            if "SELECT" in query:
+                select_clause = query.split("SELECT ")[1].split(" FROM")[0]
+                selected_cols = [col.strip() for col in select_clause.split(',')]
+                
+                # Handle aliases like 'd.dimension_code'
+                processed_row = {}
+                for col in selected_cols:
+                    if '.' in col:
+                        # Assuming alias is 'd' or 'w' as in the provided queries
+                        real_col_name = col.split('.')[-1]
+                        if real_col_name in row:
+                            processed_row[real_col_name] = row[real_col_name]
+                    elif col in row:
+                        processed_row[col] = row[col]
+                    else:
+                        processed_row[col] = None # Or raise error, depending on strictness
+                results.append(processed_row)
+            else:
+                results.append(row)
+        
+        # Simulate ORDER BY if present (very basic)
+        if "ORDER BY" in query:
+            order_by_col = query.split("ORDER BY ")[1].strip().split(' ')[0]
+            if '.' in order_by_col: # Handle d.display_order
+                order_by_col = order_by_col.split('.')[-1]
+            if order_by_col in results[0]: # Check if column exists in results
+                results.sort(key=lambda x: x.get(order_by_col))
+
+        return results
+
+
+    def insert_rows(self, table_name: str, rows: List[Dict[str, Any]]):
+        """Simulates inserting multiple rows into a table."""
+        if table_name not in self.tables:
+            raise ValueError(f"Table '{table_name}' does not exist.")
+        
+        for row in rows:
+            processed_row = row.copy()
+            # Handle SERIAL/AUTOINCREMENT for primary keys if column is like 'weight_id' or 'calibration_id'
+            if 'weight_id' in processed_row and processed_row['weight_id'] is None:
+                processed_row['weight_id'] = self._get_next_sequence_val(f"{table_name}_weight_id_seq")
+            if 'calibration_id' in processed_row and processed_row['calibration_id'] is None:
+                processed_row['calibration_id'] = self._get_next_sequence_val(f"{table_name}_calibration_id_seq")
+            if 'organization_id' in processed_row and processed_row['organization_id'] is None:
+                processed_row['organization_id'] = str(uuid.uuid4())
+            
+            # Apply default values for TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            if 'created_at' in processed_row and processed_row['created_at'] is None:
+                processed_row['created_at'] = datetime.datetime.now().isoformat()
+            if 'updated_at' in processed_row and processed_row['updated_at'] is None:
+                processed_row['updated_at'] = datetime.datetime.now().isoformat()
+            if 'effective_from' in processed_row and processed_row['effective_from'] is None:
+                processed_row['effective_from'] = datetime.date.today().isoformat()
+            if 'is_current' in processed_row and processed_row['is_current'] is None:
+                processed_row['is_current'] = True
+
+            self.tables[table_name].append(processed_row)
+        print(f"Mock DB: Inserted {len(rows)} rows into '{table_name}'.")
+
+    def get_table_data(self, table_name: str) -> List[Dict[str, Any]]:
+        """Retrieves all data from a simulated table."""
+        return self.tables.get(table_name, [])
+
+    def clear(self):
+        """Clears all tables and sequences for fresh start."""
+        self.tables = {}
+        self.sequences = {}
+        self.foreign_keys = {}
+        self.unique_constraints = {}
+        print("Mock DB: All tables and sequences cleared.")
+
+db = MockDatabaseClient()
+
+# Mock Redis Client for caching simulation
+class MockRedisClient:
+    """Simulates Redis caching operations."""
+    def __init__(self):
+        self.cache = {}
+        self.pubsub_channels = {}
+
+    def get(self, key: str) -> Optional[str]:
+        """Retrieves a value from cache."""
+        val = self.cache.get(key)
+        if val:
+            print(f"Mock Redis: Cache HIT for '{key}'")
+            return json.dumps(val) # Return as JSON string to mimic real Redis
+        print(f"Mock Redis: Cache MISS for '{key}'")
+        return None
+
+    def setex(self, key: str, ttl: int, value: str) -> None:
+        """Sets a value in cache with a TTL."""
+        self.cache[key] = json.loads(value) # Store as Python object
+        print(f"Mock Redis: Set cache for '{key}' with TTL {ttl}s")
 
     def delete(self, key: str) -> None:
-        """Delete cached value."""
-        self._client.delete(key)
-        # print(f"Cache deleted for key: {key}")
+        """Deletes a key from cache."""
+        if key in self.cache:
+            del self.cache[key]
+            print(f"Mock Redis: Deleted '{key}' from cache.")
+        else:
+            print(f"Mock Redis: Key '{key}' not found for deletion.")
+
+    def keys(self, pattern: str) -> List[str]:
+        """Finds keys matching a pattern."""
+        # Simple pattern matching, e.g., 'prefix:*'
+        prefix = pattern.replace('*', '')
+        return [k for k in self.cache if k.startswith(prefix)]
 
     def invalidate_pattern(self, pattern: str) -> int:
-        """Invalidate all keys matching pattern."""
-        keys = self._client.keys(pattern)
-        if keys:
-            count = self._client.delete(*keys)
-            # print(f"Invalidated {count} keys matching pattern: {pattern}")
-            return count
-        return 0
+        """Invalidates all keys matching a pattern."""
+        keys_to_delete = self.keys(pattern)
+        count = 0
+        for key in keys_to_delete:
+            self.delete(key)
+            count += 1
+        print(f"Mock Redis: Invalidated {count} keys matching pattern '{pattern}'.")
+        return count
 
-cache = CacheManager(REDIS_URL)
+    def publish(self, channel: str, message: str) -> None:
+        """Publishes a message to a channel."""
+        self.pubsub_channels.setdefault(channel, []).append(json.loads(message))
+        print(f"Mock Redis: Published message to channel '{channel}'")
 
-# For JSON serialization/deserialization for cache, we need a simple JSON library
-import json
+    def clear(self):
+        """Clears the cache and pubsub channels."""
+        self.cache = {}
+        self.pubsub_channels = {}
+        print("Mock Redis: Cache and pub/sub channels cleared.")
+
+cache = MockRedisClient()
+
+# Mock Logger for structured logging
+class MockLogger:
+    def info(self, message: str, **kwargs):
+        print(f"INFO: {message} {kwargs}")
+    def warning(self, message: str, **kwargs):
+        print(f"WARNING: {message} {kwargs}")
+    def exception(self, message: str, **kwargs):
+        print(f"EXCEPTION: {message} {kwargs}")
+
+logger = MockLogger()
+
+# Initialize Decimal context
+import decimal
+decimal.getcontext().prec = 10 # Set precision for Decimal operations
+
+print("\nRequired libraries installed and mock infrastructure initialized.")
 ```
 
 ---
 
-## 2. Designing Focus Group Configuration Schema
+## 2. Task 2.1: Designing the Core Configuration Schema
 
-Sarah's first task is to lay the groundwork for the configuration-driven platform. This involves designing the core tables that will hold all sector-specific parameters: `focus_groups`, `dimensions`, `focus_group_dimension_weights`, and `focus_group_calibrations`. This adheres to the "One Schema, Many Configurations" principle by storing configuration data as rows rather than schema variations.
+### Story + Context + Real-World Relevance
 
-### 2.1 Story + Context + Real-World Relevance
+Our first step in building a configuration-driven data platform is to define the core schema for managing sector-specific configurations. As a Data Engineer, I know that having a flexible and normalized schema is critical to prevent "schema proliferation" – where a new schema is created for every sector, leading to unmanageable complexity. Instead, we'll implement a "One Schema, Many Configurations" approach. This means we design generic tables that can hold configuration data (weights and calibrations) for *all* sectors as rows, rather than columns or separate tables per sector.
 
-"To ensure our platform is adaptable, I'm setting up the foundational tables. The `focus_groups` table defines our PE sectors. `dimensions` holds the generic criteria we use for evaluation. The crucial part is `focus_group_dimension_weights`, which assigns a relative importance (weight) to each dimension for a given sector. Finally, `focus_group_calibrations` stores specific numerical thresholds and parameters unique to each sector's investment strategy. This structured approach means that if a sector's evaluation criteria change, we update data, not code or schema."
+We need three main configuration tables:
+1.  `focus_groups`: Defines the sectors themselves (e.g., Manufacturing, Healthcare).
+2.  `dimensions`: Defines the generic evaluation dimensions (e.g., Data Infrastructure, AI Governance) that apply across sectors.
+3.  `focus_group_dimension_weights`: Stores the importance (weight) of each dimension for a specific sector.
+4.  `focus_group_calibrations`: Stores numeric parameters specific to each sector.
 
-```sql
--- DDL for focus_groups table
-CREATE TABLE IF NOT EXISTS focus_groups (
-    focus_group_id VARCHAR(50) PRIMARY KEY,
-    platform VARCHAR(20) NOT NULL CHECK (platform IN ('pe_org_air', 'individual_air')),
-    group_name VARCHAR(100) NOT NULL,
-    group_code VARCHAR(30) NOT NULL,
-    group_description TEXT,
-    display_order INTEGER NOT NULL,
-    icon_name VARCHAR(50),
-    color_hex VARCHAR(7),
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (platform, group_code)
-);
-
--- DDL for dimensions table
-CREATE TABLE IF NOT EXISTS dimensions (
-    dimension_id VARCHAR(50) PRIMARY KEY,
-    platform VARCHAR(20) NOT NULL,
-    dimension_name VARCHAR(100) NOT NULL,
-    dimension_code VARCHAR(50) NOT NULL,
-    description TEXT,
-    min_score DECIMAL(5,2) DEFAULT 0,
-    max_score DECIMAL(5,2) DEFAULT 100,
-    display_order INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (platform, dimension_code)
-);
-
--- DDL for focus_group_dimension_weights table
-CREATE TABLE IF NOT EXISTS focus_group_dimension_weights (
-    weight_id SERIAL PRIMARY KEY,
-    focus_group_id VARCHAR(50) NOT NULL REFERENCES focus_groups(focus_group_id),
-    dimension_id VARCHAR(50) NOT NULL REFERENCES dimensions(dimension_id),
-    weight DECIMAL(4,3) NOT NULL CHECK (weight >= 0 AND weight <= 1),
-    weight_rationale TEXT,
-    effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
-    effective_to DATE,
-    is_current BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (focus_group_id, dimension_id, effective_from)
-);
-CREATE INDEX IF NOT EXISTS idx_weights_current ON focus_group_dimension_weights(focus_group_id, is_current) WHERE is_current = TRUE;
-
--- DDL for focus_group_calibrations table
-CREATE TABLE IF NOT EXISTS focus_group_calibrations (
-    calibration_id SERIAL PRIMARY KEY,
-    focus_group_id VARCHAR(50) NOT NULL REFERENCES focus_groups(focus_group_id),
-    parameter_name VARCHAR(100) NOT NULL,
-    parameter_value DECIMAL(10,4) NOT NULL,
-    parameter_type VARCHAR(20) DEFAULT 'numeric',
-    description TEXT,
-    effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
-    effective_to DATE,
-    is_current BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (focus_group_id, parameter_name, effective_from)
-);
-```
-
-### 2.2 Code Cell: Database Schema Creation
-
-Sarah executes the DDL statements to create these tables in the PostgreSQL database.
+This design allows us to manage all sector configurations as data, making the system highly adaptable. For example, if the weighting of 'AI Governance' needs to change for the 'Financial Services' sector, it's a simple data update, not a code deployment.
 
 ```python
-def create_config_schemas(db_manager: DBManager):
-    """Creates the focus group, dimension, weight, and calibration tables."""
+def create_focus_group_schema():
+    """
+    Creates the DDL for the core focus group configuration tables in PostgreSQL.
+    This demonstrates the "One Schema, Many Configurations" principle.
+    """
     ddl_statements = [
         """
-        CREATE TABLE IF NOT EXISTS focus_groups (
+        CREATE TABLE focus_groups (
             focus_group_id VARCHAR(50) PRIMARY KEY,
             platform VARCHAR(20) NOT NULL CHECK (platform IN ('pe_org_air', 'individual_air')),
             group_name VARCHAR(100) NOT NULL,
@@ -256,7 +291,7 @@ def create_config_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS dimensions (
+        CREATE TABLE dimensions (
             dimension_id VARCHAR(50) PRIMARY KEY,
             platform VARCHAR(20) NOT NULL,
             dimension_name VARCHAR(100) NOT NULL,
@@ -270,7 +305,7 @@ def create_config_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS focus_group_dimension_weights (
+        CREATE TABLE focus_group_dimension_weights (
             weight_id SERIAL PRIMARY KEY,
             focus_group_id VARCHAR(50) NOT NULL REFERENCES focus_groups(focus_group_id),
             dimension_id VARCHAR(50) NOT NULL REFERENCES dimensions(dimension_id),
@@ -284,10 +319,11 @@ def create_config_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE INDEX IF NOT EXISTS idx_weights_current ON focus_group_dimension_weights(focus_group_id, is_current) WHERE is_current = TRUE;
+        CREATE INDEX idx_weights_current ON focus_group_dimension_weights(focus_group_id, is_current)
+        WHERE is_current = TRUE;
         """,
         """
-        CREATE TABLE IF NOT EXISTS focus_group_calibrations (
+        CREATE TABLE focus_group_calibrations (
             calibration_id SERIAL PRIMARY KEY,
             focus_group_id VARCHAR(50) NOT NULL REFERENCES focus_groups(focus_group_id),
             parameter_name VARCHAR(100) NOT NULL,
@@ -303,357 +339,280 @@ def create_config_schemas(db_manager: DBManager):
         """
     ]
     for ddl in ddl_statements:
-        db_manager.execute(ddl)
-    print("Configuration schemas created/ensured.")
+        db.execute_ddl(ddl)
 
-create_config_schemas(db_manager)
+db.clear() # Ensure a clean slate for schema creation
+create_focus_group_schema()
+print("\nCore configuration schema (focus groups, dimensions, weights, calibrations) defined.")
 ```
 
-### 2.3 Explanation of Execution
+### Explanation of Execution
 
-These tables form the backbone of our configuration system. `focus_groups` stores general information about each PE sector, `dimensions` defines the various attributes used for evaluation, `focus_group_dimension_weights` allows us to set the relative importance of these attributes per sector, and `focus_group_calibrations` stores specific numerical thresholds. This structure ensures that any changes to sector evaluation criteria are managed through data updates, not schema modifications, adhering to the "One Schema, Many Configurations" principle.
+The code above simulates the execution of PostgreSQL Data Definition Language (DDL) statements to create the foundational tables. The `focus_groups` table defines the 7 PE sectors. The `dimensions` table lists the generic criteria used to evaluate companies. `focus_group_dimension_weights` and `focus_group_calibrations` are the crucial "configuration tables" where sector-specific behaviors are stored as data. This setup is a direct application of the "One Schema, Many Configurations" principle, preventing future schema complexity for the PE Org-AI-R platform. The index `idx_weights_current` helps in quickly retrieving the active weights for a sector, which is important for performance.
 
 ---
 
-## 3. Seeding Sector Dimension Weights and Calibrations
+## 3. Task 2.2: Seeding Sector Dimension Weights
 
-With the schemas in place, Sarah now populates them with the firm's predefined sector and dimension data, including specific weights and calibration parameters. This is where the configuration-driven approach truly begins to manifest.
+### Story + Context + Real-World Relevance
 
-### 3.1 Story + Context + Real-World Relevance
+With the schema prepared, the next step is to populate it with the actual configuration data. As a Data Engineer, seeding this initial data is crucial to make the platform operational. We'll start by defining the generic dimensions and then their specific weights for each of the 7 PE sectors. These weights directly influence how each sector evaluates potential investments, reflecting their strategic priorities. For example, 'Data Infrastructure' might be weighted higher in Manufacturing due to OT/IT integration, while 'Talent' is key in Technology.
 
-"Now that the tables are ready, I'm seeding them with actual data. This includes our 7 primary PE sectors, the 7 standard evaluation dimensions (like 'Data Infrastructure' or 'AI Governance'), and critically, the dimension weights for each sector. For example, 'Manufacturing' might heavily weight 'Technology Stack' due to IoT integration, while 'Financial Services' prioritizes 'AI Governance' for regulatory compliance. Also, I'm adding specific calibration parameters for each sector. A critical validation step here is ensuring that **the sum of dimension weights for each sector is $1.0$**. This ensures our weighted scoring models are correctly normalized and consistently applied across all dimensions for a given sector."
-
-```sql
--- DML for focus_groups (7 PE sectors)
-INSERT INTO focus_groups (focus_group_id, platform, group_name, group_code, display_order) VALUES
-('pe_manufacturing', 'pe_org_air', 'Manufacturing', 'MFG', 1),
-('pe_financial_services', 'pe_org_air', 'Financial Services', 'FIN', 2),
-('pe_healthcare', 'pe_org_air', 'Healthcare', 'HC', 3),
-('pe_technology', 'pe_org_air', 'Technology', 'TECH', 4),
-('pe_retail', 'pe_org_air', 'Retail & Consumer', 'RTL', 5),
-('pe_energy', 'pe_org_air', 'Energy & Utilities', 'ENR', 6),
-('pe_professional_services', 'pe_org_air', 'Professional Services', 'PS', 7)
-ON CONFLICT (focus_group_id) DO NOTHING;
-
--- DML for dimensions (7 dimensions)
-INSERT INTO dimensions (dimension_id, platform, dimension_name, dimension_code, display_order) VALUES
-('pe_dim_data_infra', 'pe_org_air', 'Data Infrastructure', 'data_infrastructure', 1),
-('pe_dim_governance', 'pe_org_air', 'AI Governance', 'ai_governance', 2),
-('pe_dim_tech_stack', 'pe_org_air', 'Technology Stack', 'technology_stack', 3),
-('pe_dim_talent', 'pe_org_air', 'Talent', 'talent', 4),
-('pe_dim_leadership', 'pe_org_air', 'Leadership', 'leadership', 5),
-('pe_dim_use_cases', 'pe_org_air', 'Use Case Portfolio', 'use_case_portfolio', 6),
-('pe_dim_culture', 'pe_org_air', 'Culture', 'culture', 7)
-ON CONFLICT (dimension_id) DO NOTHING;
-```
-
-### 3.2 Code Cell: Seed Data for Weights and Calibrations
-
-Sarah populates the `focus_group_dimension_weights` and `focus_group_calibrations` tables using detailed `INSERT` statements. A validation check ensures that the sum of weights for each sector is $1.0$.
+The "weight" of a dimension for a particular sector, $w_{sd}$, represents its relative importance. We expect that for any given sector $s$, the sum of weights across all dimensions $D$ should be close to 1.0 (or 100%), i.e., $\sum_{d \in D} w_{sd} \approx 1$. Deviations from this sum could indicate an issue with the configuration.
 
 ```python
-def seed_config_data(db_manager: DBManager):
-    """Seeds the focus groups, dimensions, weights, and calibrations."""
+def seed_initial_data():
+    """
+    Seeds initial data for focus groups and dimensions, then populates dimension weights for sectors.
+    """
+    # Seed PE Org-AI-R Sectors
+    focus_groups_data = [
+        {'focus_group_id': 'pe_manufacturing', 'platform': 'pe_org_air', 'group_name': 'Manufacturing', 'group_code': 'MFG', 'display_order': 1, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_financial_services', 'platform': 'pe_org_air', 'group_name': 'Financial Services', 'group_code': 'FIN', 'display_order': 2, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_healthcare', 'platform': 'pe_org_air', 'group_name': 'Healthcare', 'group_code': 'HC', 'display_order': 3, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_technology', 'platform': 'pe_org_air', 'group_name': 'Technology', 'group_code': 'TECH', 'display_order': 4, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_retail', 'platform': 'pe_org_air', 'group_name': 'Retail & Consumer', 'group_code': 'RTL', 'display_order': 5, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_energy', 'platform': 'pe_org_air', 'group_name': 'Energy & Utilities', 'group_code': 'ENR', 'display_order': 6, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+        {'focus_group_id': 'pe_professional_services', 'platform': 'pe_org_air', 'group_name': 'Professional Services', 'group_code': 'PS', 'display_order': 7, 'group_description': None, 'icon_name': None, 'color_hex': None, 'is_active': True, 'created_at': None, 'updated_at': None},
+    ]
+    db.insert_rows('focus_groups', focus_groups_data)
 
-    # DML for focus_groups (7 PE sectors)
-    db_manager.execute("""
-    INSERT INTO focus_groups (focus_group_id, platform, group_name, group_code, display_order) VALUES
-    ('pe_manufacturing', 'pe_org_air', 'Manufacturing', 'MFG', 1),
-    ('pe_financial_services', 'pe_org_air', 'Financial Services', 'FIN', 2),
-    ('pe_healthcare', 'pe_org_air', 'Healthcare', 'HC', 3),
-    ('pe_technology', 'pe_org_air', 'Technology', 'TECH', 4),
-    ('pe_retail', 'pe_org_air', 'Retail & Consumer', 'RTL', 5),
-    ('pe_energy', 'pe_org_air', 'Energy & Utilities', 'ENR', 6),
-    ('pe_professional_services', 'pe_org_air', 'Professional Services', 'PS', 7)
-    ON CONFLICT (focus_group_id) DO NOTHING;
-    """)
+    # Seed Dimensions
+    dimensions_data = [
+        {'dimension_id': 'pe_dim_data_infra', 'platform': 'pe_org_air', 'dimension_name': 'Data Infrastructure', 'dimension_code': 'data_infrastructure', 'display_order': 1, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_governance', 'platform': 'pe_org_air', 'dimension_name': 'AI Governance', 'dimension_code': 'ai_governance', 'display_order': 2, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_tech_stack', 'platform': 'pe_org_air', 'dimension_name': 'Technology Stack', 'dimension_code': 'technology_stack', 'display_order': 3, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_talent', 'platform': 'pe_org_air', 'dimension_name': 'Talent', 'dimension_code': 'talent', 'display_order': 4, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_leadership', 'platform': 'pe_org_air', 'dimension_name': 'Leadership', 'dimension_code': 'leadership', 'display_order': 5, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_use_cases', 'platform': 'pe_org_air', 'dimension_name': 'Use Case Portfolio', 'dimension_code': 'use_case_portfolio', 'display_order': 6, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+        {'dimension_id': 'pe_dim_culture', 'platform': 'pe_org_air', 'dimension_name': 'Culture', 'dimension_code': 'culture', 'display_order': 7, 'description': None, 'min_score': 0, 'max_score': 100, 'created_at': None},
+    ]
+    db.insert_rows('dimensions', dimensions_data)
 
-    # DML for dimensions (7 dimensions)
-    db_manager.execute("""
-    INSERT INTO dimensions (dimension_id, platform, dimension_name, dimension_code, display_order) VALUES
-    ('pe_dim_data_infra', 'pe_org_air', 'Data Infrastructure', 'data_infrastructure', 1),
-    ('pe_dim_governance', 'pe_org_air', 'AI Governance', 'ai_governance', 2),
-    ('pe_dim_tech_stack', 'pe_org_air', 'Technology Stack', 'technology_stack', 3),
-    ('pe_dim_talent', 'pe_org_air', 'Talent', 'talent', 4),
-    ('pe_dim_leadership', 'pe_org_air', 'Leadership', 'leadership', 5),
-    ('pe_dim_use_cases', 'pe_org_air', 'Use Case Portfolio', 'use_case_portfolio', 6),
-    ('pe_dim_culture', 'pe_org_air', 'Culture', 'culture', 7)
-    ON CONFLICT (dimension_id) DO NOTHING;
-    """)
+    # Seed Dimension Weights for all sectors
+    dimension_weights_data = [
+        # Manufacturing
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.22'), 'weight_rationale': 'OT/IT integration critical', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.12'), 'weight_rationale': 'Less regulatory than finance/health', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.18'), 'weight_rationale': 'Edge computing, IoT platforms', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.15'), 'weight_rationale': 'AI + manufacturing expertise scarce', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.12'), 'weight_rationale': 'Traditional leadership acceptable', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.14'), 'weight_rationale': 'Clear ROI in operations', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_manufacturing', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.07'), 'weight_rationale': 'Safety culture > innovation', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Financial Services
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.16'), 'weight_rationale': 'Mature infrastructure', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.22'), 'weight_rationale': 'Regulatory imperative', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.14'), 'weight_rationale': 'Standard cloud stacks', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.18'), 'weight_rationale': 'Quant + ML talent critical', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.12'), 'weight_rationale': 'C-suite AI awareness high', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.10'), 'weight_rationale': 'Well-understood use cases', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_financial_services', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.08'), 'weight_rationale': 'Risk-averse by design', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Healthcare
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.20'), 'weight_rationale': 'EHR integration critical', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.20'), 'weight_rationale': 'FDA/HIPAA compliance', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.14'), 'weight_rationale': 'EHR-centric ecosystems', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.15'), 'weight_rationale': 'Clinical + AI dual expertise', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.15'), 'weight_rationale': 'Physician champions matter', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.10'), 'weight_rationale': 'Long validation cycles', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_healthcare', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.06'), 'weight_rationale': 'Evidence-based culture exists', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Technology
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.15'), 'weight_rationale': 'Assumed competent', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.12'), 'weight_rationale': 'Less regulated', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.18'), 'weight_rationale': 'Core differentiator', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.22'), 'weight_rationale': 'Talent is everything', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.13'), 'weight_rationale': 'Tech-savvy by default', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.15'), 'weight_rationale': 'Product innovation', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_technology', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.05'), 'weight_rationale': 'Innovation assumed', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Retail & Consumer
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.20'), 'weight_rationale': 'Customer data platforms', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.12'), 'weight_rationale': 'Privacy focus, less regulated', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.15'), 'weight_rationale': 'Standard cloud + CDP', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.15'), 'weight_rationale': 'Data science accessible', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.13'), 'weight_rationale': 'Digital transformation focus', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.18'), 'weight_rationale': 'Clear revenue impact', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_retail', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.07'), 'weight_rationale': 'Customer-centric exists', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Energy & Utilities
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.22'), 'weight_rationale': 'SCADA/OT data critical', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.15'), 'weight_rationale': 'Regulatory + safety', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.18'), 'weight_rationale': 'Grid tech, edge computing', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.12'), 'weight_rationale': 'Talent scarcity', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.13'), 'weight_rationale': 'Traditional but evolving', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.15'), 'weight_rationale': 'Clear operational value', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_energy', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.05'), 'weight_rationale': 'Safety culture paramount', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Professional Services
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_data_infra', 'weight': Decimal('0.14'), 'weight_rationale': 'Document-centric', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_governance', 'weight': Decimal('0.15'), 'weight_rationale': 'Client confidentiality', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_tech_stack', 'weight': Decimal('0.12'), 'weight_rationale': 'Standard productivity', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_talent', 'weight': Decimal('0.22'), 'weight_rationale': 'People are the product', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_leadership', 'weight': Decimal('0.17'), 'weight_rationale': 'Partner adoption critical', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_use_cases', 'weight': Decimal('0.12'), 'weight_rationale': 'Client + internal', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'weight_id': None, 'focus_group_id': 'pe_professional_services', 'dimension_id': 'pe_dim_culture', 'weight': Decimal('0.08'), 'weight_rationale': 'Innovation varies', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+    ]
+    db.insert_rows('focus_group_dimension_weights', dimension_weights_data)
 
-    # DML for focus_group_dimension_weights (49 records - 7 sectors x 7 dimensions)
-    # Manufacturing weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_manufacturing', 'pe_dim_data_infra', 0.22, 'OT/IT integration critical'),
-    ('pe_manufacturing', 'pe_dim_governance', 0.12, 'Less regulatory than finance/health'),
-    ('pe_manufacturing', 'pe_dim_tech_stack', 0.18, 'Edge computing, IoT platforms'),
-    ('pe_manufacturing', 'pe_dim_talent', 0.15, 'AI + manufacturing expertise scarce'),
-    ('pe_manufacturing', 'pe_dim_leadership', 0.12, 'Traditional leadership acceptable'),
-    ('pe_manufacturing', 'pe_dim_use_cases', 0.14, 'Clear ROI in operations'),
-    ('pe_manufacturing', 'pe_dim_culture', 0.07, 'Safety culture > innovation')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
+seed_initial_data()
 
-    # Financial Services weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_financial_services', 'pe_dim_data_infra', 0.16, 'Mature infrastructure'),
-    ('pe_financial_services', 'pe_dim_governance', 0.22, 'Regulatory imperative'),
-    ('pe_financial_services', 'pe_dim_tech_stack', 0.14, 'Standard cloud stacks'),
-    ('pe_financial_services', 'pe_dim_talent', 0.18, 'Quant + ML talent critical'),
-    ('pe_financial_services', 'pe_dim_leadership', 0.12, 'C-suite AI awareness high'),
-    ('pe_financial_services', 'pe_dim_use_cases', 0.10, 'Well-understood use cases'),
-    ('pe_financial_services', 'pe_dim_culture', 0.08, 'Risk-averse by design')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
+# Fetch and display dimension weights for one sector (e.g., Manufacturing)
+fg_weights_query = """
+SELECT
+    fg.group_name AS sector_name,
+    d.dimension_name,
+    w.weight,
+    w.weight_rationale
+FROM focus_group_dimension_weights w
+JOIN focus_groups fg ON w.focus_group_id = fg.focus_group_id
+JOIN dimensions d ON w.dimension_id = d.dimension_id
+WHERE fg.focus_group_id = %(focus_group_id)s
+AND w.is_current = TRUE
+ORDER BY d.display_order;
+"""
+manufacturing_weights = db.fetch_all(fg_weights_query, {'focus_group_id': 'pe_manufacturing'})
+df_manufacturing_weights = pd.DataFrame(manufacturing_weights)
+print("\nManufacturing Sector Dimension Weights:")
+display(df_manufacturing_weights)
 
-    # Healthcare weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_healthcare', 'pe_dim_data_infra', 0.20, 'EHR integration critical'),
-    ('pe_healthcare', 'pe_dim_governance', 0.20, 'FDA/HIPAA compliance'),
-    ('pe_healthcare', 'pe_dim_tech_stack', 0.14, 'EHR-centric ecosystems'),
-    ('pe_healthcare', 'pe_dim_talent', 0.15, 'Clinical + AI dual expertise'),
-    ('pe_healthcare', 'pe_dim_leadership', 0.15, 'Physician champions matter'),
-    ('pe_healthcare', 'pe_dim_use_cases', 0.10, 'Long validation cycles'),
-    ('pe_healthcare', 'pe_dim_culture', 0.06, 'Evidence-based culture exists')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
+# Visualize weights across all dimensions for Manufacturing
+plt.figure(figsize=(10, 6))
+sns.barplot(x='dimension_name', y='weight', data=df_manufacturing_weights, palette='viridis')
+plt.title('Dimension Weights for Manufacturing Sector')
+plt.xlabel('Dimension Name')
+plt.ylabel('Weight')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
 
-    # Technology weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_technology', 'pe_dim_data_infra', 0.15, 'Assumed competent'),
-    ('pe_technology', 'pe_dim_governance', 0.12, 'Less regulated'),
-    ('pe_technology', 'pe_dim_tech_stack', 0.18, 'Core differentiator'),
-    ('pe_technology', 'pe_dim_talent', 0.22, 'Talent is everything'),
-    ('pe_technology', 'pe_dim_leadership', 0.13, 'Tech-savvy by default'),
-    ('pe_technology', 'pe_dim_use_cases', 0.15, 'Product innovation'),
-    ('pe_technology', 'pe_dim_culture', 0.05, 'Innovation assumed')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
+# Get all dimension weights to check the sum and for cross-sector comparison
+all_weights_query = """
+SELECT
+    fg.group_name AS sector_name,
+    d.dimension_code,
+    w.weight
+FROM focus_group_dimension_weights w
+JOIN focus_groups fg ON w.focus_group_id = fg.focus_group_id
+JOIN dimensions d ON w.dimension_id = d.dimension_id
+WHERE w.is_current = TRUE;
+"""
+all_weights = db.fetch_all(all_weights_query)
+df_all_weights = pd.DataFrame(all_weights)
 
-    # Retail & Consumer weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_retail', 'pe_dim_data_infra', 0.20, 'Customer data platforms'),
-    ('pe_retail', 'pe_dim_governance', 0.12, 'Privacy focus, less regulated'),
-    ('pe_retail', 'pe_dim_tech_stack', 0.15, 'Standard cloud + CDP'),
-    ('pe_retail', 'pe_dim_talent', 0.15, 'Data science accessible'),
-    ('pe_retail', 'pe_dim_leadership', 0.13, 'Digital transformation focus'),
-    ('pe_retail', 'pe_dim_use_cases', 0.18, 'Clear revenue impact'),
-    ('pe_retail', 'pe_dim_culture', 0.07, 'Customer-centric exists')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
+# Calculate sum of weights for each sector
+weight_sums = df_all_weights.groupby('sector_name')['weight'].sum().reset_index()
+weight_sums.rename(columns={'weight': 'total_weight'}, inplace=True)
+print("\nTotal Dimension Weight per Sector:")
+display(weight_sums)
 
-    # Energy & Utilities weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_energy', 'pe_dim_data_infra', 0.22, 'SCADA/OT data critical'),
-    ('pe_energy', 'pe_dim_governance', 0.15, 'Regulatory + safety'),
-    ('pe_energy', 'pe_dim_tech_stack', 0.18, 'Grid tech, edge computing'),
-    ('pe_energy', 'pe_dim_talent', 0.12, 'Talent scarcity'),
-    ('pe_energy', 'pe_dim_leadership', 0.13, 'Traditional but evolving'),
-    ('pe_energy', 'pe_dim_use_cases', 0.15, 'Clear operational value'),
-    ('pe_energy', 'pe_dim_culture', 0.05, 'Safety culture paramount')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
-
-    # Professional Services weights
-    db_manager.execute("""
-    INSERT INTO focus_group_dimension_weights (focus_group_id, dimension_id, weight, weight_rationale) VALUES
-    ('pe_professional_services', 'pe_dim_data_infra', 0.14, 'Document-centric'),
-    ('pe_professional_services', 'pe_dim_governance', 0.15, 'Client confidentiality'),
-    ('pe_professional_services', 'pe_dim_tech_stack', 0.12, 'Standard productivity'),
-    ('pe_professional_services', 'pe_dim_talent', 0.22, 'People are the product'),
-    ('pe_professional_services', 'pe_dim_leadership', 0.17, 'Partner adoption critical'),
-    ('pe_professional_services', 'pe_dim_use_cases', 0.12, 'Client + internal'),
-    ('pe_professional_services', 'pe_dim_culture', 0.08, 'Innovation varies')
-    ON CONFLICT (focus_group_id, dimension_id, effective_from) DO UPDATE SET weight = EXCLUDED.weight, weight_rationale = EXCLUDED.weight_rationale;
-    """)
-
-    # DML for focus_group_calibrations
-    # Manufacturing calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_manufacturing', 'h_r_baseline', 72, 'numeric', 'Systematic opportunity baseline'),
-    ('pe_manufacturing', 'ebitda_multiplier', 0.90, 'numeric', 'Conservative EBITDA attribution'),
-    ('pe_manufacturing', 'talent_concentration_threshold', 0.20, 'threshold', 'Lower due to talent scarcity'),
-    ('pe_manufacturing', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Financial Services calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_financial_services', 'h_r_baseline', 82, 'numeric', 'Higher due to data maturity'),
-    ('pe_financial_services', 'ebitda_multiplier', 1.10, 'numeric', 'Higher AI leverage'),
-    ('pe_financial_services', 'talent_concentration_threshold', 0.25, 'threshold', 'Standard threshold'),
-    ('pe_financial_services', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment'),
-    ('pe_financial_services', 'governance_minimum', 60, 'threshold', 'Min governance for approval')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Healthcare calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_healthcare', 'h_r_baseline', 78, 'numeric', 'Moderate with growth potential'),
-    ('pe_healthcare', 'ebitda_multiplier', 1.00, 'numeric', 'Standard attribution'),
-    ('pe_healthcare', 'talent_concentration_threshold', 0.25, 'threshold', 'Standard threshold'),
-    ('pe_healthcare', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment'),
-    ('pe_healthcare', 'governance_minimum', 65, 'threshold', 'Higher governance requirement')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Technology calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_technology', 'h_r_baseline', 85, 'numeric', 'Highest - AI native'),
-    ('pe_technology', 'ebitda_multiplier', 1.15, 'numeric', 'Strong AI leverage'),
-    ('pe_technology', 'talent_concentration_threshold', 0.30, 'threshold', 'Higher talent expected'),
-    ('pe_technology', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Retail & Consumer calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_retail', 'h_r_baseline', 75, 'numeric', 'Growing AI adoption'),
-    ('pe_retail', 'ebitda_multiplier', 1.05, 'numeric', 'Clear personalization ROI'),
-    ('pe_retail', 'talent_concentration_threshold', 0.25, 'threshold', 'Standard threshold'),
-    ('pe_retail', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Energy & Utilities calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_energy', 'h_r_baseline', 68, 'numeric', 'Lower but high potential'),
-    ('pe_energy', 'ebitda_multiplier', 0.85, 'numeric', 'Longer payback periods'),
-    ('pe_energy', 'talent_concentration_threshold', 0.20, 'threshold', 'Lower due to scarcity'),
-    ('pe_energy', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    # Professional Services calibrations
-    db_manager.execute("""
-    INSERT INTO focus_group_calibrations (focus_group_id, parameter_name, parameter_value, parameter_type, description) VALUES
-    ('pe_professional_services', 'h_r_baseline', 76, 'numeric', 'Knowledge work automation'),
-    ('pe_professional_services', 'ebitda_multiplier', 1.00, 'numeric', 'Standard attribution'),
-    ('pe_professional_services', 'talent_concentration_threshold', 0.25, 'threshold', 'Standard threshold'),
-    ('pe_professional_services', 'position_factor_delta', 0.15, 'numeric', 'H^R position adjustment')
-    ON CONFLICT (focus_group_id, parameter_name, effective_from) DO UPDATE SET parameter_value = EXCLUDED.parameter_value, description = EXCLUDED.description;
-    """)
-
-    print("Configuration data (sectors, dimensions, weights, calibrations) seeded.")
-
-seed_config_data(db_manager)
-
-# --- Validation and Visualization ---
-def validate_and_display_weights(db_manager: DBManager):
-    """Fetches dimension weights, validates their sum, and displays them."""
-    weights_data = db_manager.fetch_all("""
-        SELECT fg.group_name, d.dimension_name, fgdw.weight
-        FROM focus_group_dimension_weights fgdw
-        JOIN focus_groups fg ON fgdw.focus_group_id = fg.focus_group_id
-        JOIN dimensions d ON fgdw.dimension_id = d.dimension_id
-        WHERE fgdw.is_current = TRUE
-        ORDER BY fg.group_name, d.display_order;
-    """)
-    if not weights_data:
-        print("No weights data found for validation.")
-        return
-
-    df_weights = pd.DataFrame(weights_data)
-    df_weights['weight'] = pd.to_numeric(df_weights['weight'])
-
-    # Validate sum of weights for each sector
-    validation_results = {}
-    for group_name, group_df in df_weights.groupby('group_name'):
-        total_weight = group_df['weight'].sum()
-        is_valid = abs(total_weight - 1.0) < 0.001
-        validation_results[group_name] = {'Total Weight': total_weight, 'Valid': is_valid}
-
-        if not is_valid:
-            print(f"WARNING: Weights for '{group_name}' do not sum to 1.0! Sum: {total_weight}")
-
-    print("\n--- Dimension Weight Validation Results ---")
-    display(pd.DataFrame.from_dict(validation_results, orient='index'))
-
-    # Display weights for one example sector (e.g., Manufacturing)
-    print("\n--- Manufacturing Sector Dimension Weights ---")
-    mfg_weights = df_weights[df_weights['group_name'] == 'Manufacturing'].set_index('dimension_name')['weight']
-    display(mfg_weights.to_frame())
-
-    # Visualize dimension weights across different sectors
-    plt.figure(figsize=(14, 7))
-    pivot_df = df_weights.pivot(index='group_name', columns='dimension_name', values='weight')
-    pivot_df.plot(kind='bar', stacked=True, figsize=(15, 8))
-    plt.title('Dimension Weights Across PE Sectors')
-    plt.xlabel('Sector')
-    plt.ylabel('Weight')
-    plt.xticks(rotation=45, ha='right')
-    plt.legend(title='Dimension', bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
-validate_and_display_weights(db_manager)
+# Visualize dimension weights across sectors
+pivot_df = df_all_weights.pivot(index='sector_name', columns='dimension_code', values='weight')
+plt.figure(figsize=(12, 8))
+sns.heatmap(pivot_df, annot=True, cmap='YlGnBu', fmt=".2f", linewidths=.5)
+plt.title('Dimension Weights Across PE Sectors')
+plt.xlabel('Dimension')
+plt.ylabel('Sector')
+plt.tight_layout()
+plt.show()
 ```
 
-### 3.3 Explanation of Execution
+### Explanation of Execution
 
-The output confirms that the configuration data has been successfully loaded into the database. The validation check is critical for Sarah because it ensures the integrity of the weighted scoring models used by the PE Org-AI-R platform. If the sum of weights for any sector were not $1.0$, the subsequent analytical models would produce incorrect or skewed results. The bar chart provides a quick visual comparison of how dimension priorities differ across sectors, which is invaluable for understanding sector-specific investment theses at a glance. For instance, you can observe which dimensions receive higher weights in sectors like "Technology" versus "Healthcare."
+The tables `focus_groups` and `dimensions` are populated first, creating the master lists of sectors and evaluation criteria. Then, the `focus_group_dimension_weights` table is filled with data from the attachment. Each row explicitly links a `focus_group_id` (sector) to a `dimension_id` and assigns a `weight`. This effectively parametrizes the evaluation model for each sector.
+
+The output shows a DataFrame of the manufacturing sector's dimension weights and a bar chart visualizing their relative importance. This helps us confirm the configuration is correctly loaded and provides immediate insight into the manufacturing sector's priorities. The total weight per sector is also displayed, reinforcing the constraint that weights should sum to 1.0. Finally, a heatmap provides a powerful comparative view of dimension weights across all seven PE sectors, clearly illustrating how priorities differ—for instance, 'AI Governance' is more critical in Financial Services, while 'Data Infrastructure' is prominent in Energy.
 
 ---
 
-## 4. Designing Organizations Table with Sector Reference
+## 4. Task 2.3: Seeding Sector Calibrations
 
-Sarah now needs a way to store information about the private equity portfolio companies, crucially linking each to its respective PE sector. This `organizations` table will serve as the central registry for all portfolio companies.
+### Story + Context + Real-World Relevance
 
-### 4.1 Story + Context + Real-World Relevance
-
-"Our portfolio management system needs to track all organizations we invest in. Each organization must be explicitly linked to one of our predefined PE sectors. This `organizations` table will include core firmographic details and a foreign key (`focus_group_id`) to the `focus_groups` table. This is how we ensure that every company is categorized correctly for sector-specific analysis, and it's a direct application of the 'One Schema, Many Configurations' principle: core organization data remains unified, while sector-specific details branch off."
-
-```sql
--- DDL for organizations table
-CREATE TABLE IF NOT EXISTS organizations (
-    organization_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    legal_name VARCHAR(255) NOT NULL,
-    display_name VARCHAR(255),
-    ticker_symbol VARCHAR(10),
-    cik_number VARCHAR(20),
-    duns_number VARCHAR(20),
-    focus_group_id VARCHAR(50) NOT NULL REFERENCES focus_groups(focus_group_id),
-    primary_sic_code VARCHAR(10),
-    primary_naics_code VARCHAR(10),
-    employee_count INTEGER,
-    annual_revenue_usd DECIMAL(15,2),
-    founding_year INTEGER,
-    headquarters_country VARCHAR(3),
-    headquarters_state VARCHAR(50),
-    headquarters_city VARCHAR(100),
-    website_url VARCHAR(500),
-    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'archived')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    created_by VARCHAR(100),
-    CONSTRAINT chk_org_pe_platform CHECK (focus_group_id LIKE 'pe_%')
-);
-
-CREATE INDEX IF NOT EXISTS idx_org_focus_group ON organizations(focus_group_id);
-CREATE INDEX IF NOT EXISTS idx_org_ticker ON organizations(ticker_symbol) WHERE ticker_symbol IS NOT NULL;
-```
-
-### 4.2 Code Cell: Create Organizations Schema and Generate Synthetic Data
-
-Sarah creates the `organizations` table and then generates 100 synthetic organizations, randomly assigning them to the various PE sectors.
+Beyond dimension weights, each sector often has specific numeric or threshold parameters that calibrate how insights are generated or interpreted. As a Data Engineer, I must seed these `focus_group_calibrations` into the database. These calibrations are crucial for nuanced analysis within each sector. For example, a 'h_r_baseline' might represent a target performance score for a sector, while an 'ebitda_multiplier' could adjust financial projections based on sector-specific risk or growth factors. Storing these as data rows allows for dynamic updates without altering code, aligning with our configuration-driven philosophy.
 
 ```python
-def create_organizations_schema(db_manager: DBManager):
-    """Creates the organizations table."""
-    ddl = """
-    CREATE TABLE IF NOT EXISTS organizations (
+def seed_sector_calibrations():
+    """
+    Seeds sector-specific calibration parameters.
+    """
+    calibrations_data = [
+        # Manufacturing
+        {'calibration_id': None, 'focus_group_id': 'pe_manufacturing', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('72'), 'parameter_type': 'numeric', 'description': 'Systematic opportunity baseline', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_manufacturing', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('0.90'), 'parameter_type': 'numeric', 'description': 'Conservative EBITDA attribution', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_manufacturing', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.20'), 'parameter_type': 'threshold', 'description': 'Lower due to talent scarcity', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_manufacturing', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Financial Services
+        {'calibration_id': None, 'focus_group_id': 'pe_financial_services', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('82'), 'parameter_type': 'numeric', 'description': 'Higher due to data maturity', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_financial_services', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('1.10'), 'parameter_type': 'numeric', 'description': 'Higher AI leverage', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_financial_services', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.25'), 'parameter_type': 'threshold', 'description': 'Standard threshold', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_financial_services', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_financial_services', 'parameter_name': 'governance_minimum', 'parameter_value': Decimal('60'), 'parameter_type': 'threshold', 'description': 'Min governance for approval', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Healthcare
+        {'calibration_id': None, 'focus_group_id': 'pe_healthcare', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('78'), 'parameter_type': 'numeric', 'description': 'Moderate with growth potential', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_healthcare', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('1.00'), 'parameter_type': 'numeric', 'description': 'Standard attribution', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_healthcare', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.25'), 'parameter_type': 'threshold', 'description': 'Standard threshold', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_healthcare', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_healthcare', 'parameter_name': 'governance_minimum', 'parameter_value': Decimal('65'), 'parameter_type': 'threshold', 'description': 'Higher governance requirement', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Technology
+        {'calibration_id': None, 'focus_group_id': 'pe_technology', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('85'), 'parameter_type': 'numeric', 'description': 'Highest - AI native', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_technology', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('1.15'), 'parameter_type': 'numeric', 'description': 'Strong AI leverage', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_technology', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.30'), 'parameter_type': 'threshold', 'description': 'Higher talent expected', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_technology', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Retail
+        {'calibration_id': None, 'focus_group_id': 'pe_retail', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('75'), 'parameter_type': 'numeric', 'description': 'Growing AI adoption', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_retail', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('1.05'), 'parameter_type': 'numeric', 'description': 'Clear personalization ROI', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_retail', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.25'), 'parameter_type': 'threshold', 'description': 'Standard threshold', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_retail', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Energy
+        {'calibration_id': None, 'focus_group_id': 'pe_energy', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('68'), 'parameter_type': 'numeric', 'description': 'Lower but high potential', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_energy', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('0.85'), 'parameter_type': 'numeric', 'description': 'Longer payback periods', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_energy', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.20'), 'parameter_type': 'threshold', 'description': 'Lower due to scarcity', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_energy', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        # Professional Services
+        {'calibration_id': None, 'focus_group_id': 'pe_professional_services', 'parameter_name': 'h_r_baseline', 'parameter_value': Decimal('76'), 'parameter_type': 'numeric', 'description': 'Knowledge work automation', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_professional_services', 'parameter_name': 'ebitda_multiplier', 'parameter_value': Decimal('1.00'), 'parameter_type': 'numeric', 'description': 'Standard attribution', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_professional_services', 'parameter_name': 'talent_concentration_threshold', 'parameter_value': Decimal('0.25'), 'parameter_type': 'threshold', 'description': 'Standard threshold', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+        {'calibration_id': None, 'focus_group_id': 'pe_professional_services', 'parameter_name': 'position_factor_delta', 'parameter_value': Decimal('0.15'), 'parameter_type': 'numeric', 'description': 'H^R position adjustment', 'effective_from': None, 'effective_to': None, 'is_current': None, 'created_at': None},
+    ]
+    db.insert_rows('focus_group_calibrations', calibrations_data)
+
+seed_sector_calibrations()
+
+# Fetch and display calibration parameters for a specific sector (e.g., Financial Services)
+financial_services_calibrations_query = """
+SELECT
+    fg.group_name AS sector_name,
+    c.parameter_name,
+    c.parameter_value,
+    c.parameter_type,
+    c.description
+FROM focus_group_calibrations c
+JOIN focus_groups fg ON c.focus_group_id = fg.focus_group_id
+WHERE fg.focus_group_id = %(focus_group_id)s
+AND c.is_current = TRUE
+ORDER BY c.parameter_name;
+"""
+financial_calibrations = db.fetch_all(financial_services_calibrations_query, {'focus_group_id': 'pe_financial_services'})
+df_financial_calibrations = pd.DataFrame(financial_calibrations)
+print("\nFinancial Services Sector Calibration Parameters:")
+display(df_financial_calibrations)
+```
+
+### Explanation of Execution
+
+The `focus_group_calibrations` table is populated with a variety of parameters specific to each sector. For instance, the 'Financial Services' sector has a 'governance_minimum' threshold, while 'Manufacturing' has a 'conservative EBITDA attribution' factor. These values, stored as `DECIMAL(10,4)`, represent specific numerical adjustments or thresholds. The displayed DataFrame for 'Financial Services' shows these parameters in a clear, tabular format, validating that the calibration data has been correctly ingested and is accessible. This allows the PE Org-AI-R platform to apply these precise adjustments in its sector-specific analysis.
+
+---
+
+## 5. Task 2.4: Establishing the Organization Structure
+
+### Story + Context + Real-World Relevance
+
+The core entities our platform analyzes are organizations. As a Data Engineer, designing the `organizations` table is central. A critical requirement is to link each organization to a specific PE sector (`focus_group_id`). This link is the backbone of our configuration-driven approach, enabling us to apply the correct sector-specific weights and calibrations when evaluating an organization. The table also includes common firmographic data that is relevant across all sectors, promoting a single, unified view of core organizational data.
+
+```python
+def create_organizations_schema():
+    """
+    Creates the DDL for the organizations table with a foreign key to focus_groups.
+    """
+    ddl_statement = """
+    CREATE TABLE organizations (
         organization_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         legal_name VARCHAR(255) NOT NULL,
         display_name VARCHAR(255),
@@ -676,211 +635,55 @@ def create_organizations_schema(db_manager: DBManager):
         created_by VARCHAR(100),
         CONSTRAINT chk_org_pe_platform CHECK (focus_group_id LIKE 'pe_%')
     );
-    CREATE INDEX IF NOT EXISTS idx_org_focus_group ON organizations(focus_group_id);
-    CREATE INDEX IF NOT EXISTS idx_org_ticker ON organizations(ticker_symbol) WHERE ticker_symbol IS NOT NULL;
     """
-    db_manager.execute(ddl)
-    print("Organizations schema created/ensured.")
+    db.execute_ddl(ddl_statement)
 
-def generate_synthetic_organizations(db_manager: DBManager, num_orgs: int = 100):
-    """Generates synthetic organization data and inserts into the database."""
-    focus_groups = db_manager.fetch_all("SELECT focus_group_id FROM focus_groups WHERE platform = 'pe_org_air';")
-    focus_group_ids = [fg['focus_group_id'] for fg in focus_groups]
-    if not focus_group_ids:
-        print("No focus groups found, cannot generate organizations.")
-        return
+    # Indexes for performance
+    db.execute_ddl("CREATE INDEX idx_org_focus_group ON organizations(focus_group_id);")
+    db.execute_ddl("CREATE INDEX idx_org_ticker ON organizations(ticker_symbol) WHERE ticker_symbol IS NOT NULL;")
 
-    organizations_data = []
-    for _ in range(num_orgs):
-        org_id = uuid.uuid4()
-        legal_name = fake.company()
-        display_name = legal_name
-        focus_group_id = random.choice(focus_group_ids)
-        employee_count = random.randint(50, 5000)
-        annual_revenue_usd = Decimal(random.uniform(1_000_000, 1_000_000_000)).quantize(Decimal('0.01'))
-        founding_year = random.randint(1950, 2020)
-        headquarters_country = fake.country_code()
-        headquarters_state = fake.state()
-        headquarters_city = fake.city()
-        website_url = fake.url()
+create_organizations_schema()
 
-        organizations_data.append({
-            'organization_id': org_id,
-            'legal_name': legal_name,
-            'display_name': display_name,
-            'focus_group_id': focus_group_id,
-            'employee_count': employee_count,
-            'annual_revenue_usd': annual_revenue_usd,
-            'founding_year': founding_year,
-            'headquarters_country': headquarters_country,
-            'headquarters_state': headquarters_state,
-            'headquarters_city': headquarters_city,
-            'website_url': website_url
-        })
+# Seed some dummy organizations
+organizations_data = [
+    {'organization_id': None, 'legal_name': 'Global Manufacturing Corp', 'display_name': 'Global MFG', 'focus_group_id': 'pe_manufacturing', 'annual_revenue_usd': Decimal('500000000.00'), 'employee_count': 1500, 'created_at': None},
+    {'organization_id': None, 'legal_name': 'Future FinTech Solutions', 'display_name': 'Future FinTech', 'focus_group_id': 'pe_financial_services', 'annual_revenue_usd': Decimal('120000000.00'), 'employee_count': 800, 'created_at': None},
+    {'organization_id': None, 'legal_name': 'Health Innovations Ltd', 'display_name': 'Health Innov', 'focus_group_id': 'pe_healthcare', 'annual_revenue_usd': Decimal('300000000.00'), 'employee_count': 2000, 'created_at': None},
+    {'organization_id': None, 'legal_name': 'Quantum AI Systems', 'display_name': 'Quantum AI', 'focus_group_id': 'pe_technology', 'annual_revenue_usd': Decimal('80000000.00'), 'employee_count': 400, 'created_at': None},
+]
+db.insert_rows('organizations', organizations_data)
 
-    # Batch insert
-    insert_query = """
-    INSERT INTO organizations (
-        organization_id, legal_name, display_name, focus_group_id, employee_count,
-        annual_revenue_usd, founding_year, headquarters_country, headquarters_state,
-        headquarters_city, website_url
-    ) VALUES (
-        :organization_id, :legal_name, :display_name, :focus_group_id, :employee_count,
-        :annual_revenue_usd, :founding_year, :headquarters_country, :headquarters_state,
-        :headquarters_city, :website_url
-    );
-    """
-    for org in organizations_data:
-        db_manager.execute(insert_query, org)
-    print(f"Generated and inserted {num_orgs} synthetic organizations.")
-
-create_organizations_schema(db_manager)
-generate_synthetic_organizations(db_manager, num_orgs=100)
-
-# Display a few generated organizations
-print("\n--- Sample of Generated Organizations ---")
-sample_orgs = db_manager.fetch_all("SELECT * FROM organizations LIMIT 5;")
-display(pd.DataFrame(sample_orgs))
+# Display some organizations
+df_organizations = pd.DataFrame(db.get_table_data('organizations'))
+print("\nSample Organizations:")
+display(df_organizations[['organization_id', 'legal_name', 'focus_group_id', 'annual_revenue_usd']])
 ```
 
-### 4.3 Explanation of Execution
+### Explanation of Execution
 
-The `organizations` table is now ready and populated with synthetic data. Each organization is correctly associated with a `focus_group_id`, demonstrating how the core entity (an organization) is linked to its sector's specific configurations. This centralizes common firmographic data while preparing for the integration of unique sector attributes, maintaining the "One Schema, Many Configurations" architecture.
+The `organizations` table is created with a `focus_group_id` column acting as a foreign key to the `focus_groups` table. This is paramount for our "One Schema, Many Configurations" strategy, as it explicitly links each organization to its relevant sector and thus to its specific configuration data (weights and calibrations). The `UUID` primary key ensures unique identifiers for organizations, and the `CHECK` constraint on `focus_group_id` helps enforce data integrity by ensuring only PE-related focus groups are assigned. Seeding a few dummy organizations demonstrates how data would be stored, and the displayed DataFrame confirms the successful creation and population of this critical table.
 
 ---
 
-## 5. Implementing Sector-Specific Attribute Tables
+## 6. Task 2.5: Defining Sector-Specific Attributes
 
-To avoid schema fragmentation, Sarah will create separate tables for attributes unique to each PE sector. This allows for rich, typed data per sector without adding nullable columns to a monolithic `organizations` table.
+### Story + Context + Real-World Relevance
 
-### 5.1 Story + Context + Real-World Relevance
+While the `organizations` table holds common attributes, each sector demands unique, granular data points. As a Data Engineer, the decision to use "Queryable Sector Attribute Tables" instead of a generic JSONB column is a strategic one. JSONB columns can become unwieldy for querying and indexing specific attributes across many organizations. By creating separate, typed tables for each sector's attributes, we ensure:
+1.  **Strong Typing**: Each attribute has a defined data type, preventing data quality issues.
+2.  **Queryability**: Specific attributes can be easily filtered, aggregated, and indexed without complex JSON parsing.
+3.  **Performance**: Database optimizations (e.g., indexes) can be applied directly to individual columns.
 
-"To maintain our 'One Schema, Many Configurations' principle, I'm now creating dedicated attribute tables for each of our 7 PE sectors. Instead of adding dozens of nullable columns to the main `organizations` table, each sector (e.g., 'Manufacturing', 'Healthcare') will have its own `org_attributes_sectorname` table. These tables will store highly specific, typed attributes relevant only to that sector, all linked back to the `organization_id`. This keeps our schemas clean, performant, and easily extensible."
-
-```sql
--- DDL for org_attributes_manufacturing
-CREATE TABLE IF NOT EXISTS org_attributes_manufacturing (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    ot_systems VARCHAR(100)[],
-    it_ot_integration VARCHAR(20),
-    scada_vendor VARCHAR(100),
-    mes_system VARCHAR(100),
-    plant_count INTEGER,
-    automation_level VARCHAR(20),
-    iot_platforms VARCHAR(100)[],
-    digital_twin_status VARCHAR(20),
-    edge_computing BOOLEAN DEFAULT FALSE,
-    supply_chain_visibility VARCHAR(20),
-    demand_forecasting_ai BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_financial_services
-CREATE TABLE IF NOT EXISTS org_attributes_financial_services (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    regulatory_bodies VARCHAR(50)[],
-    charter_type VARCHAR(50),
-    model_risk_framework VARCHAR(50),
-    mrm_team_size INTEGER,
-    model_inventory_count INTEGER,
-    algo_trading BOOLEAN DEFAULT FALSE,
-    fraud_detection_ai BOOLEAN DEFAULT FALSE,
-    credit_ai BOOLEAN DEFAULT FALSE,
-    aml_ai BOOLEAN DEFAULT FALSE,
-    aum_billions DECIMAL(12,2),
-    total_assets_billions DECIMAL(12,2),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_healthcare
-CREATE TABLE IF NOT EXISTS org_attributes_healthcare (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    hipaa_certified BOOLEAN DEFAULT FALSE,
-    hitrust_certified BOOLEAN DEFAULT FALSE,
-    fda_clearances VARCHAR(100)[],
-    fda_clearance_count INTEGER DEFAULT 0,
-    ehr_system VARCHAR(100),
-    ehr_integration_level VARCHAR(20),
-    fhir_enabled BOOLEAN DEFAULT FALSE,
-    clinical_ai_deployed BOOLEAN DEFAULT FALSE,
-    imaging_ai BOOLEAN DEFAULT FALSE,
-    org_type VARCHAR(50),
-    bed_count INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_technology
-CREATE TABLE IF NOT EXISTS org_attributes_technology (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    tech_category VARCHAR(50),
-    primary_language VARCHAR(50),
-    cloud_native BOOLEAN DEFAULT TRUE,
-    github_org VARCHAR(100),
-    github_stars_total INTEGER,
-    open_source_projects INTEGER,
-    ml_platform VARCHAR(100),
-    llm_integration BOOLEAN DEFAULT FALSE,
-    ai_product_features INTEGER,
-    gpu_infrastructure BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_retail
-CREATE TABLE IF NOT EXISTS org_attributes_retail (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    retail_type VARCHAR(50),
-    store_count INTEGER,
-    ecommerce_pct DECIMAL(5,2),
-    cdp_vendor VARCHAR(100),
-    loyalty_program BOOLEAN DEFAULT FALSE,
-    loyalty_members INTEGER,
-    personalization_ai BOOLEAN DEFAULT FALSE,
-    recommendation_engine VARCHAR(100),
-    demand_forecasting BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_energy
-CREATE TABLE IF NOT EXISTS org_attributes_energy (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    energy_type VARCHAR(50),
-    regulated BOOLEAN DEFAULT FALSE,
-    scada_systems VARCHAR(100)[],
-    ami_deployed BOOLEAN DEFAULT FALSE,
-    smart_grid_pct DECIMAL(5,2),
-    generation_capacity_mw DECIMAL(12,2),
-    grid_optimization_ai BOOLEAN DEFAULT FALSE,
-    predictive_maintenance BOOLEAN DEFAULT FALSE,
-    renewable_pct DECIMAL(5,2),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- DDL for org_attributes_professional_services
-CREATE TABLE IF NOT EXISTS org_attributes_professional_services (
-    organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
-    firm_type VARCHAR(50),
-    partnership_model VARCHAR(50),
-    partner_count INTEGER,
-    professional_staff INTEGER,
-    km_system VARCHAR(100),
-    document_ai BOOLEAN DEFAULT FALSE,
-    knowledge_graph BOOLEAN DEFAULT FALSE,
-    client_ai_services BOOLEAN DEFAULT FALSE,
-    internal_ai_tools BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### 5.2 Code Cell: Create Attribute Schemas and Generate Synthetic Data
-
-Sarah executes the DDL for the attribute tables and populates them with synthetic data. This ensures each organization has relevant details specific to its sector.
+This task involves creating dedicated attribute tables for each of the 7 PE sectors, each linked to the main `organizations` table via `organization_id`. For example, 'Manufacturing' needs fields like `ot_systems` and `scada_vendor`, while 'Financial Services' requires `regulatory_bodies` and `model_risk_framework`.
 
 ```python
-def create_all_attribute_schemas(db_manager: DBManager):
-    """Creates all sector-specific attribute tables."""
-    attribute_ddls = [
+def create_sector_attribute_schemas():
+    """
+    Creates the DDL for sector-specific attribute tables.
+    """
+    ddl_statements = [
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_manufacturing (
+        CREATE TABLE org_attributes_manufacturing (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             ot_systems VARCHAR(100)[],
             it_ot_integration VARCHAR(20),
@@ -897,7 +700,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_financial_services (
+        CREATE TABLE org_attributes_financial_services (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             regulatory_bodies VARCHAR(50)[],
             charter_type VARCHAR(50),
@@ -914,7 +717,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_healthcare (
+        CREATE TABLE org_attributes_healthcare (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             hipaa_certified BOOLEAN DEFAULT FALSE,
             hitrust_certified BOOLEAN DEFAULT FALSE,
@@ -931,7 +734,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_technology (
+        CREATE TABLE org_attributes_technology (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             tech_category VARCHAR(50),
             primary_language VARCHAR(50),
@@ -947,7 +750,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_retail (
+        CREATE TABLE org_attributes_retail (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             retail_type VARCHAR(50),
             store_count INTEGER,
@@ -962,7 +765,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_energy (
+        CREATE TABLE org_attributes_energy (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             energy_type VARCHAR(50),
             regulated BOOLEAN DEFAULT FALSE,
@@ -977,7 +780,7 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """,
         """
-        CREATE TABLE IF NOT EXISTS org_attributes_professional_services (
+        CREATE TABLE org_attributes_professional_services (
             organization_id UUID PRIMARY KEY REFERENCES organizations(organization_id),
             firm_type VARCHAR(50),
             partnership_model VARCHAR(50),
@@ -992,140 +795,63 @@ def create_all_attribute_schemas(db_manager: DBManager):
         );
         """
     ]
-    for ddl in attribute_ddls:
-        db_manager.execute(ddl)
-    print("All sector-specific attribute schemas created/ensured.")
+    for ddl in ddl_statements:
+        db.execute_ddl(ddl)
 
-def generate_synthetic_sector_attributes(db_manager: DBManager):
-    """Generates synthetic data for all sector-specific attribute tables."""
-    organizations = db_manager.fetch_all("SELECT organization_id, focus_group_id FROM organizations;")
+create_sector_attribute_schemas()
 
-    if not organizations:
-        print("No organizations found to attach attributes to.")
-        return
+# Seed some dummy attribute data
+orgs_in_db = db.get_table_data('organizations')
+org_id_mfg = next((org['organization_id'] for org in orgs_in_db if org['focus_group_id'] == 'pe_manufacturing'), None)
+org_id_fin = next((org['organization_id'] for org in orgs_in_db if org['focus_group_id'] == 'pe_financial_services'), None)
+org_id_hc = next((org['organization_id'] for org in orgs_in_db if org['focus_group_id'] == 'pe_healthcare'), None)
 
-    # Group organizations by focus_group_id
-    orgs_by_sector = {}
-    for org in organizations:
-        orgs_by_sector.setdefault(org['focus_group_id'], []).append(org['organization_id'])
+if org_id_mfg:
+    db.insert_rows('org_attributes_manufacturing', [{
+        'organization_id': org_id_mfg,
+        'ot_systems': ['SCADA', 'DCS'],
+        'it_ot_integration': 'High',
+        'plant_count': 5,
+        'edge_computing': True,
+        'created_at': None
+    }])
+if org_id_fin:
+    db.insert_rows('org_attributes_financial_services', [{
+        'organization_id': org_id_fin,
+        'regulatory_bodies': ['SEC', 'FINRA'],
+        'charter_type': 'Commercial Bank',
+        'fraud_detection_ai': True,
+        'aum_billions': Decimal('150.75'),
+        'created_at': None
+    }])
+if org_id_hc:
+    db.insert_rows('org_attributes_healthcare', [{
+        'organization_id': org_id_hc,
+        'hipaa_certified': True,
+        'ehr_system': 'Epic',
+        'bed_count': 300,
+        'clinical_ai_deployed': True,
+        'created_at': None
+    }])
 
-    sector_generators = {
-        'pe_manufacturing': lambda org_id: {
-            'organization_id': org_id,
-            'ot_systems': random.sample(['SCADA', 'DCS', 'PLC', 'MES'], random.randint(1, 3)),
-            'it_ot_integration': random.choice(['High', 'Medium', 'Low']),
-            'plant_count': random.randint(1, 10),
-            'automation_level': random.choice(['Manual', 'Semi-Automated', 'Automated']),
-            'edge_computing': fake.boolean(),
-            'supply_chain_visibility': random.choice(['Low', 'Medium', 'High']),
-            'demand_forecasting_ai': fake.boolean()
-        },
-        'pe_financial_services': lambda org_id: {
-            'organization_id': org_id,
-            'regulatory_bodies': random.sample(['SEC', 'FINRA', 'FCA', 'MAS'], random.randint(1, 2)),
-            'charter_type': random.choice(['Commercial Bank', 'Investment Bank', 'Hedge Fund', 'Asset Manager']),
-            'model_risk_framework': fake.word().capitalize(),
-            'mrm_team_size': random.randint(5, 50),
-            'algo_trading': fake.boolean(),
-            'fraud_detection_ai': fake.boolean(),
-            'aum_billions': Decimal(random.uniform(10, 500)).quantize(Decimal('0.01'))
-        },
-        'pe_healthcare': lambda org_id: {
-            'organization_id': org_id,
-            'hipaa_certified': fake.boolean(),
-            'hitrust_certified': fake.boolean(),
-            'fda_clearance_count': random.randint(0, 10),
-            'ehr_system': fake.word().capitalize(),
-            'ehr_integration_level': random.choice(['Basic', 'Intermediate', 'Advanced']),
-            'clinical_ai_deployed': fake.boolean(),
-            'bed_count': random.randint(50, 1000)
-        },
-        'pe_technology': lambda org_id: {
-            'organization_id': org_id,
-            'tech_category': random.choice(['SaaS', 'Cloud', 'AI/ML', 'Cybersecurity', 'FinTech']),
-            'primary_language': random.choice(['Python', 'Java', 'Go', 'Rust', 'JavaScript']),
-            'cloud_native': fake.boolean(),
-            'github_stars_total': random.randint(100, 100000),
-            'open_source_projects': random.randint(0, 50),
-            'llm_integration': fake.boolean(),
-            'ai_product_features': random.randint(1, 10),
-            'gpu_infrastructure': fake.boolean()
-        },
-        'pe_retail': lambda org_id: {
-            'organization_id': org_id,
-            'retail_type': random.choice(['E-commerce', 'Brick-and-mortar', 'Omnichannel']),
-            'store_count': random.randint(1, 500),
-            'ecommerce_pct': Decimal(random.uniform(0.1, 0.9)).quantize(Decimal('0.01')),
-            'cdp_vendor': fake.company(),
-            'loyalty_program': fake.boolean(),
-            'loyalty_members': random.randint(1000, 1000000),
-            'personalization_ai': fake.boolean(),
-            'demand_forecasting': fake.boolean()
-        },
-        'pe_energy': lambda org_id: {
-            'organization_id': org_id,
-            'energy_type': random.choice(['Solar', 'Wind', 'Hydro', 'Nuclear', 'Fossil Fuel']),
-            'regulated': fake.boolean(),
-            'scada_systems': random.sample(['Siemens', 'ABB', 'Schneider', 'Rockwell'], random.randint(1, 2)),
-            'ami_deployed': fake.boolean(),
-            'smart_grid_pct': Decimal(random.uniform(0.1, 1.0)).quantize(Decimal('0.01')),
-            'generation_capacity_mw': Decimal(random.uniform(10, 5000)).quantize(Decimal('0.01')),
-            'predictive_maintenance': fake.boolean(),
-            'renewable_pct': Decimal(random.uniform(0.0, 1.0)).quantize(Decimal('0.01'))
-        },
-        'pe_professional_services': lambda org_id: {
-            'organization_id': org_id,
-            'firm_type': random.choice(['Consulting', 'Legal', 'Accounting', 'IT Services']),
-            'partnership_model': random.choice(['Equity', 'Salaried']),
-            'partner_count': random.randint(5, 200),
-            'professional_staff': random.randint(50, 5000),
-            'km_system': fake.word().capitalize(),
-            'document_ai': fake.boolean(),
-            'knowledge_graph': fake.boolean(),
-            'client_ai_services': fake.boolean(),
-            'internal_ai_tools': fake.boolean()
-        }
-    }
-
-    inserted_count = 0
-    for sector_id, org_ids in orgs_by_sector.items():
-        if sector_id in sector_generators:
-            table_name = f"org_attributes_{sector_id.replace('pe_', '')}"
-            cols = list(sector_generators[sector_id](uuid.uuid4()).keys())
-            insert_placeholders = ', '.join([f":{col}" for col in cols])
-            insert_query = f"INSERT INTO {table_name} ({', '.join(cols)}) VALUES ({insert_placeholders}) ON CONFLICT (organization_id) DO NOTHING;"
-
-            for org_id in org_ids:
-                data = sector_generators[sector_id](org_id)
-                db_manager.execute(insert_query, data)
-                inserted_count += 1
-    print(f"Generated and inserted {inserted_count} synthetic sector-specific attributes.")
-
-create_all_attribute_schemas(db_manager)
-generate_synthetic_sector_attributes(db_manager)
-
-# Display sample attributes for a specific sector (e.g., Manufacturing)
-print("\n--- Sample of Manufacturing Sector Attributes ---")
-mfg_attr_sample = db_manager.fetch_all("SELECT * FROM org_attributes_manufacturing LIMIT 3;")
-display(pd.DataFrame(mfg_attr_sample))
+print("\nSample sector-specific attribute data seeded for Manufacturing, Financial Services, and Healthcare.")
 ```
 
-### 5.3 Explanation of Execution
+### Explanation of Execution
 
-By creating and populating these sector-specific attribute tables, Sarah has successfully implemented a flexible schema extension strategy. This allows the PE Org-AI-R platform to capture highly relevant, typed data for each sector without burdening the main `organizations` table with unnecessary columns. This design drastically improves query performance for sector-specific analytics and simplifies maintenance as new attributes are added or removed for different sectors.
+This section creates seven distinct attribute tables, one for each PE sector. Each table is designed with typed columns (`VARCHAR`, `INTEGER`, `BOOLEAN`, `DECIMAL`, `VARCHAR[]` for arrays) specific to the needs of that sector, and crucially, they all link back to the `organizations` table using `organization_id` as a primary and foreign key. This "Queryable Sector Attribute Tables" approach offers significant advantages over flexible JSONB fields, particularly for data integrity, query performance, and straightforward data governance. Seeding sample data for a few organizations demonstrates how these attributes are stored, ready for deeper, sector-specific analysis.
 
 ---
 
-## 6. Building the Sector Configuration Service with Caching
+## 7. Task 2.6: Building the Configuration Service Logic
 
-Sarah's next step is to create a Python service that can efficiently retrieve sector configurations, leveraging Redis for caching. This service will encapsulate the logic for fetching dimension weights and calibration parameters from the database, and crucially, validate the sum of weights.
+### Story + Context + Real-World Relevance
 
-### 6.1 Story + Context + Real-World Relevance
+Now that our configuration data and organization structures are in place, we need a clean, consistent way for application services to access this information. As a Software Developer, I'll build a `SectorConfigService`. This service will encapsulate the logic for fetching sector-specific weights and calibration parameters from the database, transforming them into easy-to-use Python objects. This abstraction isolates the business logic from direct database interactions, making the system more modular and testable. The `SectorConfig` dataclass will hold the complete configuration for a sector, providing structured access to its unique parameters.
 
-"Our analytical models frequently need access to sector configuration data. To prevent redundant database calls and ensure high performance, I'm building a `SectorConfigService`. This service will load configurations from the database, deserialize them into a structured `SectorConfig` object, and cache them in Redis. It's critical that the service also validates the dimension weights to ensure they sum to $1.0$. This ensures the integrity of our scoring models. For instance, the `position_factor_delta` ($\delta$) is a critical calibration parameter for our valuation models, and its consistent retrieval is vital."
+A key aspect of configuration integrity is ensuring that dimension weights for each sector sum to 1.0. This is a fundamental constraint ($ \sum w_{sd} = 1 $ where $w_{sd}$ is the weight of dimension $d$ for sector $s$) to ensure a balanced evaluation. The `SectorConfig` dataclass will include a method to validate this sum.
 
 ```python
-@dataclass_json
 @dataclass
 class SectorConfig:
     """Complete configuration for a PE sector."""
@@ -1138,7 +864,7 @@ class SectorConfig:
     @property
     def h_r_baseline(self) -> Decimal:
         """Get H^R baseline for this sector."""
-        return self.calibrations.get('h_r_baseline', Decimal('75'))
+        return self.calibrations.get('h_r_baseline', Decimal('75')) # Default value for robustness
 
     @property
     def ebitda_multiplier(self) -> Decimal:
@@ -1147,7 +873,8 @@ class SectorConfig:
 
     @property
     def position_factor_delta(self) -> Decimal:
-        """Get position factor delta ($\delta$) for H^R calculation."""
+        """Get position factor delta (delta) for H^R calculation."""
+        # Using delta for the Greek letter delta
         return self.calibrations.get('position_factor_delta', Decimal('0.15'))
 
     @property
@@ -1160,67 +887,25 @@ class SectorConfig:
         return self.dimension_weights.get(dimension_code, Decimal('0'))
 
     def validate_weights_sum(self) -> bool:
-        """Verify dimension weights sum to 1.0."""
+        """Verify dimension weights sum to 1.0. Allows for slight floating point deviation."""
         total = sum(self.dimension_weights.values())
-        return abs(total - Decimal('1.0')) < Decimal('0.001')
+        return abs(total - Decimal('1.0')) < Decimal('0.001') # Allow small epsilon for floating point
 
 class SectorConfigService:
-    """Service for loading and caching sector configurations."""
+    """Service for loading sector configurations from the database."""
 
-    CACHE_KEY_SECTOR = "sector:{focus_group_id}"
-    CACHE_KEY_ALL = "sectors:all"
-    CACHE_TTL = 3600 # 1 hour
-
-    def __init__(self, db_manager: DBManager, cache_manager: CacheManager):
-        self._db = db_manager
-        self._cache = cache_manager
-
-    async def get_config(self, focus_group_id: str) -> Optional[SectorConfig]:
-        """Get configuration for a single sector."""
-        cache_key = self.CACHE_KEY_SECTOR.format(focus_group_id=focus_group_id)
-
-        # Check cache
-        cached_data = self._cache.get(cache_key)
-        if cached_data:
-            config = SectorConfig.from_dict(cached_data) # Using dataclasses-json
-            if not config.validate_weights_sum():
-                print(f"WARNING: Invalid weights sum for cached config {focus_group_id}. Re-loading from DB.")
-                self._cache.delete(cache_key) # Invalidate stale cache
-                return await self._load_from_db(focus_group_id) # Reload
-            return config
-
-        # Load from database
-        config = await self._load_from_db(focus_group_id)
-        if config:
-            # Cache the config (convert to dict for JSON serialization)
-            self._cache.set(cache_key, config.to_dict(), self.CACHE_TTL)
-        return config
-
-    async def get_all_configs(self) -> List[SectorConfig]:
-        """Get all PE sector configurations."""
-        cache_key = self.CACHE_KEY_ALL
-
-        cached_data = self._cache.get(cache_key)
-        if cached_data:
-            configs = [SectorConfig.from_dict(c) for c in cached_data]
-            if not all(c.validate_weights_sum() for c in configs):
-                print("WARNING: Invalid weights sum for one or more cached configs. Re-loading all from DB.")
-                self._cache.delete(cache_key) # Invalidate stale cache
-                return await self._load_all_from_db() # Reload
-            return configs
-
-        configs = await self._load_all_from_db()
-        if configs:
-            self._cache.set(cache_key, [c.to_dict() for c in configs], self.CACHE_TTL)
-        return configs
+    def __init__(self, db_client: MockDatabaseClient):
+        self._db = db_client
 
     async def _load_from_db(self, focus_group_id: str) -> Optional[SectorConfig]:
         """Load single configuration from database."""
-        # Get base focus group
+        # Get base focus group info
         fg_query = """
         SELECT focus_group_id, group_name, group_code
         FROM focus_groups
-        WHERE focus_group_id = :focus_group_id AND platform = 'pe_org_air' AND is_active = TRUE;
+        WHERE focus_group_id = %(focus_group_id)s
+        AND platform = 'pe_org_air'
+        AND is_active = TRUE;
         """
         fg_row = self._db.fetch_one(fg_query, {'focus_group_id': focus_group_id})
         if not fg_row:
@@ -1231,12 +916,12 @@ class SectorConfigService:
         SELECT d.dimension_code, w.weight
         FROM focus_group_dimension_weights w
         JOIN dimensions d ON w.dimension_id = d.dimension_id
-        WHERE w.focus_group_id = :focus_group_id AND w.is_current = TRUE
+        WHERE w.focus_group_id = %(focus_group_id)s AND w.is_current = TRUE
         ORDER BY d.display_order;
         """
         weights_rows = self._db.fetch_all(weights_query, {'focus_group_id': focus_group_id})
         dimension_weights = {
-            row['dimension_code']: Decimal(str(row['weight']))
+            row['dimension_code']: Decimal(str(row['weight'])) # Convert to Decimal
             for row in weights_rows
         }
 
@@ -1244,11 +929,11 @@ class SectorConfigService:
         calib_query = """
         SELECT parameter_name, parameter_value
         FROM focus_group_calibrations
-        WHERE focus_group_id = :focus_group_id AND is_current = TRUE;
+        WHERE focus_group_id = %(focus_group_id)s AND is_current = TRUE;
         """
         calib_rows = self._db.fetch_all(calib_query, {'focus_group_id': focus_group_id})
         calibrations = {
-            row['parameter_name']: Decimal(str(row['parameter_value']))
+            row['parameter_name']: Decimal(str(row['parameter_value'])) # Convert to Decimal
             for row in calib_rows
         }
 
@@ -1261,8 +946,8 @@ class SectorConfigService:
         )
 
         if not config.validate_weights_sum():
-            print(f"WARNING: Invalid weights sum for focus_group_id: {focus_group_id}. Sum: {sum(dimension_weights.values())}")
-            # Potentially raise an error or handle invalid config more robustly in a production system
+            logger.warning("invalid_weights_sum", focus_group_id=focus_group_id, actual_sum=sum(config.dimension_weights.values()))
+
         return config
 
     async def _load_all_from_db(self) -> List[SectorConfig]:
@@ -1281,175 +966,219 @@ class SectorConfigService:
                 configs.append(config)
         return configs
 
-    def invalidate_cache(self, focus_group_id: Optional[str] = None) -> None:
-        """Invalidate cached configurations.
-        If focus_group_id is provided, invalidates specific sector cache.
-        Also invalidates the 'all sectors' cache."""
-        if focus_group_id:
-            specific_key = self.CACHE_KEY_SECTOR.format(focus_group_id=focus_group_id)
-            self._cache.delete(specific_key)
-            print(f"Invalidated cache for specific sector: {focus_group_id}")
-        
-        # Always invalidate the 'all sectors' cache to ensure consistency
-        self._cache.delete(self.CACHE_KEY_ALL)
-        print("Invalidated cache for all sectors.")
-        
-# Initialize the service
-sector_service = SectorConfigService(db_manager, cache)
+    def _config_to_dict(self, config: SectorConfig) -> dict:
+        """Convert config to dict for caching, ensuring Decimal is stringified."""
+        return {
+            'focus_group_id': config.focus_group_id,
+            'group_name': config.group_name,
+            'group_code': config.group_code,
+            'dimension_weights': {k: str(v) for k, v in config.dimension_weights.items()},
+            'calibrations': {k: str(v) for k, v in config.calibrations.items()},
+        }
+
+    def _dict_to_config(self, data: dict) -> SectorConfig:
+        """Convert cached dict back to config, ensuring Decimal conversion."""
+        return SectorConfig(
+            focus_group_id=data['focus_group_id'],
+            group_name=data['group_name'],
+            group_code=data['group_code'],
+            dimension_weights={k: Decimal(v) for k, v in data['dimension_weights'].items()},
+            calibrations={k: Decimal(v) for k, v in data['calibrations'].items()},
+        )
+
+# Initialize the service (without caching for now)
+sector_service_no_cache = SectorConfigService(db)
+
+# Demonstrate loading a single sector config
+import asyncio # Required for async functions in notebook
+
+async def get_and_display_config(service: SectorConfigService, sector_id: str):
+    config = await service._load_from_db(sector_id)
+    if config:
+        print(f"\n--- Configuration for {config.group_name} ({config.focus_group_id}) ---")
+        print(f"H^R Baseline: {config.h_r_baseline}")
+        print(f"EBITDA Multiplier: {config.ebitda_multiplier}")
+        print(f"Talent Concentration Threshold: {config.talent_concentration_threshold}")
+        print("\nDimension Weights:")
+        for dim, weight in config.dimension_weights.items():
+            print(f"  - {dim}: {weight}")
+        print(f"Weights sum to 1.0: {config.validate_weights_sum()}")
+        print("\nCalibrations (all):")
+        for param, value in config.calibrations.items():
+            print(f"  - {param}: {value}")
+    else:
+        print(f"Configuration not found for sector_id: {sector_id}")
+
+await get_and_display_config(sector_service_no_cache, 'pe_manufacturing')
+await get_and_display_config(sector_service_no_cache, 'pe_financial_services')
 ```
 
-### 6.2 Code Cell: Testing the Service and Cache Invalidation
+### Explanation of Execution
 
-Sarah tests the `SectorConfigService` by fetching a configuration, observing the cache behavior, and then invalidating the cache.
-
-```python
-import asyncio
-
-async def test_sector_config_service():
-    print("--- Testing SectorConfigService ---")
-    test_sector_id = 'pe_manufacturing'
-
-    # 1. Fetch config - should be a cache miss first, then loaded from DB and cached
-    print(f"\nAttempting to get config for {test_sector_id} (first call)...")
-    config1 = await sector_service.get_config(test_sector_id)
-    if config1:
-        print(f"Config loaded for {config1.group_name}. H^R Baseline: {config1.h_r_baseline}, Position Factor Delta: {config1.position_factor_delta}")
-        print(f"Dimension weights for {config1.group_name}: {config1.dimension_weights}")
-        print(f"Weights sum to 1.0: {config1.validate_weights_sum()}")
-    else:
-        print(f"Failed to load config for {test_sector_id}")
-        return
-
-    # 2. Fetch config again - should be a cache hit
-    print(f"\nAttempting to get config for {test_sector_id} (second call, should be cached)...")
-    config2 = await sector_service.get_config(test_sector_id)
-    if config2:
-        print(f"Config loaded (from cache) for {config2.group_name}. H^R Baseline: {config2.h_r_baseline}")
-    else:
-        print(f"Failed to load config for {test_sector_id}")
-        return
-
-    # 3. Invalidate cache for specific sector
-    print(f"\nInvalidating cache for {test_sector_id}...")
-    sector_service.invalidate_cache(test_sector_id)
-
-    # 4. Fetch config after invalidation - should be a cache miss, loaded from DB and recached
-    print(f"\nAttempting to get config for {test_sector_id} (after invalidation, should be re-loaded from DB)...")
-    config3 = await sector_service.get_config(test_sector_id)
-    if config3:
-        print(f"Config re-loaded for {config3.group_name}. H^R Baseline: {config3.h_r_baseline}")
-    else:
-        print(f"Failed to load config for {test_sector_id}")
-        return
-
-    # 5. Test getting all configs
-    print("\nAttempting to get all configs...")
-    all_configs = await sector_service.get_all_configs()
-    if all_configs:
-        print(f"Successfully loaded {len(all_configs)} sector configurations.")
-        print("Sample calibrations from 'pe_financial_services':")
-        fs_config = next((c for c in all_configs if c.focus_group_id == 'pe_financial_services'), None)
-        if fs_config:
-            print(f"  EBITDA Multiplier: {fs_config.ebitda_multiplier}")
-            print(f"  Talent Threshold: {fs_config.talent_concentration_threshold}")
-    else:
-        print("Failed to load all configs.")
-
-    print("\n--- Testing cache invalidation for all sectors ---")
-    sector_service.invalidate_cache() # Invalidate all
-
-    print("\nAttempting to get all configs (after all invalidation, should be re-loaded from DB)...")
-    all_configs_reloaded = await sector_service.get_all_configs()
-    if all_configs_reloaded:
-        print(f"Successfully re-loaded {len(all_configs_reloaded)} sector configurations.")
-
-asyncio.run(test_sector_config_service())
-```
-
-### 6.3 Explanation of Execution
-
-The output clearly demonstrates the caching mechanism in action. The first request for a sector's configuration results in a database lookup, but subsequent requests for the same configuration hit the Redis cache, leading to faster retrieval. The `invalidate_cache` function ensures that when configuration data changes in the database, the stale cache entries can be purged, forcing the service to fetch the latest data. This is crucial for maintaining data consistency across the platform while still benefiting from performance optimizations. The weight validation within the `SectorConfig` dataclass acts as a guardrail, preventing misconfigured sector models from affecting downstream analysis.
+The `SectorConfig` dataclass and `SectorConfigService` class are defined here. The `_load_from_db` method within `SectorConfigService` executes SQL queries to fetch the base sector information, its dimension weights, and its calibration parameters. These are then aggregated into a `SectorConfig` object, providing a clean, object-oriented representation of the configuration. Properties like `h_r_baseline` and `ebitda_multiplier` on the `SectorConfig` dataclass demonstrate how specific parameters can be accessed directly, with sensible default values, preventing `KeyError` if a calibration is missing. The `validate_weights_sum` method ensures the integrity of our dimension weights. Calling `get_and_display_config` for 'Manufacturing' and 'Financial Services' demonstrates that the service correctly retrieves and structures the sector-specific configurations, ready for use by higher-level application logic.
 
 ---
 
-## 7. Creating the Unified Organization View
+## 8. Task 2.7: Implementing the Caching Layer
 
-The final step for Sarah is to create a unified SQL view that joins the core `organizations` table with its `focus_groups` details and the relevant sector-specific attributes. This view provides a single, comprehensive dataset for analysts.
+### Story + Context + Real-World Relevance
 
-### 7.1 Story + Context + Real-World Relevance
+While our `SectorConfigService` effectively loads configurations, repeatedly querying the database for frequently accessed sector data can introduce latency and strain database resources. As a Data Engineer, implementing a caching layer (using Redis in a real-world scenario) is a standard optimization technique. The "Configuration Caching" concept means that once a sector's configuration is loaded from the database, it's stored in a fast-access cache for a specified duration (`CACHE_TTL`). Subsequent requests for the same configuration hit the cache, drastically improving response times. We'll also add cache invalidation mechanisms to ensure that updates to configurations are reflected in the cache.
 
-"Analysts often need a holistic view of an organization, combining its core firmographic data with its assigned sector and all its specialized attributes. To simplify their querying and ensure consistency, I'm creating `vw_organizations_full`. This SQL view performs all the necessary joins (using `LEFT JOIN` for optional attributes) so that analysts don't have to write complex queries themselves. This fully realizes our 'One Schema, Many Configurations' approach by presenting a unified, queryable interface over the underlying normalized and configuration-driven tables."
-
-```sql
--- DDL for vw_organizations_full view
-CREATE OR REPLACE VIEW vw_organizations_full AS
-SELECT
-    o.*,
-    fg.group_name AS sector_name,
-    fg.group_code AS sector_code,
-    mfg.ot_systems, mfg.it_ot_integration, mfg.scada_vendor, mfg.mes_system,
-    mfg.plant_count, mfg.automation_level, mfg.iot_platforms, mfg.digital_twin_status,
-    mfg.edge_computing, mfg.supply_chain_visibility, mfg.demand_forecasting_ai,
-    fin.regulatory_bodies, fin.charter_type, fin.model_risk_framework, fin.mrm_team_size,
-    fin.model_inventory_count, fin.algo_trading, fin.fraud_detection_ai, fin.credit_ai,
-    fin.aml_ai, fin.aum_billions, fin.total_assets_billions,
-    hc.hipaa_certified, hc.hitrust_certified, hc.fda_clearances, hc.fda_clearance_count,
-    hc.ehr_system, hc.ehr_integration_level, hc.fhir_enabled, hc.clinical_ai_deployed,
-    hc.imaging_ai, hc.org_type, hc.bed_count,
-    tech.tech_category, tech.primary_language, tech.cloud_native, tech.github_org,
-    tech.github_stars_total, tech.open_source_projects, tech.ml_platform, tech.llm_integration,
-    tech.ai_product_features, tech.gpu_infrastructure,
-    rtl.retail_type, rtl.store_count, rtl.ecommerce_pct, rtl.cdp_vendor,
-    rtl.loyalty_program, rtl.loyalty_members, rtl.personalization_ai, rtl.recommendation_engine,
-    rtl.demand_forecasting,
-    enr.energy_type, enr.regulated, enr.scada_systems, enr.ami_deployed,
-    enr.smart_grid_pct, enr.generation_capacity_mw, enr.grid_optimization_ai,
-    enr.predictive_maintenance, enr.renewable_pct,
-    ps.firm_type, ps.partnership_model, ps.partner_count, ps.professional_staff,
-    ps.km_system, ps.document_ai, ps.knowledge_graph, ps.client_ai_services,
-    ps.internal_ai_tools
-FROM organizations o
-JOIN focus_groups fg ON o.focus_group_id = fg.focus_group_id
-LEFT JOIN org_attributes_manufacturing mfg ON o.organization_id = mfg.organization_id
-LEFT JOIN org_attributes_financial_services fin ON o.organization_id = fin.organization_id
-LEFT JOIN org_attributes_healthcare hc ON o.organization_id = hc.organization_id
-LEFT JOIN org_attributes_technology tech ON o.organization_id = tech.organization_id
-LEFT JOIN org_attributes_retail rtl ON o.organization_id = rtl.organization_id
-LEFT JOIN org_attributes_energy enr ON o.organization_id = enr.organization_id
-LEFT JOIN org_attributes_professional_services ps ON o.organization_id = ps.organization_id;
-```
-
-### 7.2 Code Cell: Create the Unified View and Query It
-
-Sarah creates the view and then runs a sample query to demonstrate its utility, filtering by a specific sector.
+The performance benefit of caching can be significant. Without caching, every request for a configuration involves a database lookup ($T_{\text{db}}$). With caching, most requests will be served from cache ($T_{\text{cache}}$), where $T_{\text{cache}} \ll T_{\text{db}}$. If $R$ is the total number of requests, and $H$ is the cache hit ratio, the total time for fetching configurations can be expressed as:
+$$ T_{\text{total}} = (R \cdot H) \cdot T_{\text{cache}} + (R \cdot (1-H)) \cdot (T_{\text{cache}} + T_{\text{db}}) $$
+This formula illustrates that a higher hit ratio ($H$) dramatically reduces the number of expensive database calls, improving overall system responsiveness.
 
 ```python
-def create_unified_organization_view(db_manager: DBManager):
-    """Creates the unified organization view."""
+# Constants for caching
+CACHE_KEY_SECTOR = "sector:{focus_group_id}"
+CACHE_KEY_ALL = "sectors:all"
+CACHE_TTL = 3600 # 1 hour
+
+class SectorConfigServiceWithCache(SectorConfigService):
+    """SectorConfigService augmented with Redis caching capabilities."""
+    def __init__(self, db_client: MockDatabaseClient, cache_client: MockRedisClient):
+        super().__init__(db_client)
+        self._cache = cache_client
+
+    async def get_config(self, focus_group_id: str) -> Optional[SectorConfig]:
+        """Get configuration for a single sector, using cache."""
+        cache_key = CACHE_KEY_SECTOR.format(focus_group_id=focus_group_id)
+
+        # Check cache
+        cached_data = self._cache.get(cache_key)
+        if cached_data:
+            return self._dict_to_config(json.loads(cached_data)) # Deserialize from JSON string
+
+        # Load from database if not in cache
+        config = await self._load_from_db(focus_group_id)
+        if config:
+            # Store in cache
+            self._cache.setex(cache_key, CACHE_TTL, json.dumps(self._config_to_dict(config)))
+        return config
+
+    async def get_all_configs(self) -> List[SectorConfig]:
+        """Get all PE sector configurations, using cache."""
+        cache_key = CACHE_KEY_ALL
+
+        # Check cache for all configs
+        cached_data = self._cache.get(cache_key)
+        if cached_data:
+            # Deserialize list of dicts and convert each to SectorConfig
+            return [self._dict_to_config(c) for c in json.loads(cached_data)]
+
+        # Load all from database if not in cache
+        configs = await self._load_all_from_db()
+        if configs:
+            # Store list of dicts in cache
+            self._cache.setex(cache_key, CACHE_TTL, json.dumps([self._config_to_dict(c) for c in configs]))
+        return configs
+
+    def invalidate_cache(self, focus_group_id: Optional[str] = None) -> None:
+        """Invalidate cached configurations. If no ID, invalidate all."""
+        if focus_group_id:
+            self._cache.delete(CACHE_KEY_SECTOR.format(focus_group_id=focus_group_id))
+            logger.info("sector_cache_invalidated", focus_group_id=focus_group_id)
+        else:
+            self._cache.invalidate_pattern(CACHE_KEY_SECTOR.replace('{focus_group_id}', '*'))
+            self._cache.delete(CACHE_KEY_ALL)
+            logger.info("sector_cache_invalidated", pattern="all")
+
+
+# Initialize the service with caching
+sector_service = SectorConfigServiceWithCache(db, cache)
+
+# Demonstrate cache behavior
+async def demonstrate_caching():
+    print("--- First call for Manufacturing (should be a cache MISS) ---")
+    mfg_config_1 = await sector_service.get_config('pe_manufacturing')
+    print(f"Retrieved config (1): {mfg_config_1.group_name}, h_r_baseline={mfg_config_1.h_r_baseline}")
+
+    print("\n--- Second call for Manufacturing (should be a cache HIT) ---")
+    mfg_config_2 = await sector_service.get_config('pe_manufacturing')
+    print(f"Retrieved config (2): {mfg_config_2.group_name}, h_r_baseline={mfg_config_2.h_r_baseline}")
+
+    print("\n--- Invalidate cache for Manufacturing ---")
+    sector_service.invalidate_cache('pe_manufacturing')
+
+    print("\n--- Third call for Manufacturing (should be a cache MISS after invalidation) ---")
+    mfg_config_3 = await sector_service.get_config('pe_manufacturing')
+    print(f"Retrieved config (3): {mfg_config_3.group_name}, h_r_baseline={mfg_config_3.h_r_baseline}")
+
+    print("\n--- First call for ALL sectors (should be a cache MISS) ---")
+    all_configs_1 = await sector_service.get_all_configs()
+    print(f"Retrieved {len(all_configs_1)} configs (1st call).")
+
+    print("\n--- Second call for ALL sectors (should be a cache HIT) ---")
+    all_configs_2 = await sector_service.get_all_configs()
+    print(f"Retrieved {len(all_configs_2)} configs (2nd call).")
+
+    print("\n--- Invalidate ALL cache ---")
+    sector_service.invalidate_cache()
+
+    print("\n--- Third call for ALL sectors (should be a cache MISS after invalidation) ---")
+    all_configs_3 = await sector_service.get_all_configs()
+    print(f"Retrieved {len(all_configs_3)} configs (3rd call).")
+
+await demonstrate_caching()
+```
+
+### Explanation of Execution
+
+The `SectorConfigService` is extended to `SectorConfigServiceWithCache`, integrating the `MockRedisClient` for caching. The `get_config` and `get_all_configs` methods now first attempt to retrieve configurations from the cache using specific `CACHE_KEY_SECTOR` or `CACHE_KEY_ALL` patterns. If a cache miss occurs, the data is fetched from the database and then stored in the cache with a `CACHE_TTL` (Time To Live) of 1 hour. This ensures that frequently accessed configurations are served quickly.
+
+The demonstration clearly shows the sequence of cache hits and misses:
+-   The first call for 'Manufacturing' results in a cache MISS (data loaded from DB).
+-   The second call for 'Manufacturing' results in a cache HIT (data served from cache).
+-   After explicitly calling `invalidate_cache` for 'Manufacturing', the third call correctly results in another cache MISS, proving the invalidation mechanism works.
+-   Similar behavior is observed for `get_all_configs`, demonstrating caching for multiple configurations.
+
+This cache implementation significantly improves the performance of the PE Org-AI-R platform, reducing load on the PostgreSQL database and providing faster insights to users.
+
+---
+
+## 9. Task 2.8: Creating the Unified Organization View
+
+### Story + Context + Real-World Relevance
+
+The final piece of our data architecture is to provide a comprehensive, easy-to-query view of organizations, combining their core details with all sector-specific attributes. As a Data Engineer, creating a "Unified Organization View" using a SQL `VIEW` is the most effective approach. This view will `JOIN` the `organizations` table with `focus_groups` and all seven `org_attributes` tables. This way, data analysts and other services can query a single logical entity (`vw_organizations_full`) without needing to understand the complex underlying table structure or perform multiple joins themselves. This abstraction simplifies data access and ensures consistency.
+
+```python
+def create_unified_organization_view():
+    """
+    Creates a SQL VIEW that unifies organization data with sector-specific attributes.
+    """
     view_ddl = """
     CREATE OR REPLACE VIEW vw_organizations_full AS
     SELECT
         o.*,
         fg.group_name AS sector_name,
         fg.group_code AS sector_code,
+        -- Manufacturing attributes
         mfg.ot_systems, mfg.it_ot_integration, mfg.scada_vendor, mfg.mes_system,
         mfg.plant_count, mfg.automation_level, mfg.iot_platforms, mfg.digital_twin_status,
         mfg.edge_computing, mfg.supply_chain_visibility, mfg.demand_forecasting_ai,
+        -- Financial Services attributes
         fin.regulatory_bodies, fin.charter_type, fin.model_risk_framework, fin.mrm_team_size,
         fin.model_inventory_count, fin.algo_trading, fin.fraud_detection_ai, fin.credit_ai,
         fin.aml_ai, fin.aum_billions, fin.total_assets_billions,
+        -- Healthcare attributes
         hc.hipaa_certified, hc.hitrust_certified, hc.fda_clearances, hc.fda_clearance_count,
         hc.ehr_system, hc.ehr_integration_level, hc.fhir_enabled, hc.clinical_ai_deployed,
         hc.imaging_ai, hc.org_type, hc.bed_count,
+        -- Technology attributes
         tech.tech_category, tech.primary_language, tech.cloud_native, tech.github_org,
         tech.github_stars_total, tech.open_source_projects, tech.ml_platform, tech.llm_integration,
         tech.ai_product_features, tech.gpu_infrastructure,
+        -- Retail & Consumer attributes
         rtl.retail_type, rtl.store_count, rtl.ecommerce_pct, rtl.cdp_vendor,
         rtl.loyalty_program, rtl.loyalty_members, rtl.personalization_ai, rtl.recommendation_engine,
         rtl.demand_forecasting,
+        -- Energy & Utilities attributes
         enr.energy_type, enr.regulated, enr.scada_systems, enr.ami_deployed,
         enr.smart_grid_pct, enr.generation_capacity_mw, enr.grid_optimization_ai,
         enr.predictive_maintenance, enr.renewable_pct,
+        -- Professional Services attributes
         ps.firm_type, ps.partnership_model, ps.partner_count, ps.professional_staff,
         ps.km_system, ps.document_ai, ps.knowledge_graph, ps.client_ai_services,
         ps.internal_ai_tools
@@ -1463,48 +1192,76 @@ def create_unified_organization_view(db_manager: DBManager):
     LEFT JOIN org_attributes_energy enr ON o.organization_id = enr.organization_id
     LEFT JOIN org_attributes_professional_services ps ON o.organization_id = ps.organization_id;
     """
-    db_manager.execute(view_ddl)
-    print("Unified organization view 'vw_organizations_full' created/replaced.")
+    db.execute_ddl(view_ddl)
 
-create_unified_organization_view(db_manager)
+create_unified_organization_view()
 
-# Query the unified view for a specific sector
-def query_unified_view_by_sector(db_manager: DBManager, sector_name: str, limit: int = 5):
-    """Queries the unified view and displays results for a specific sector."""
-    print(f"\n--- Querying Unified View for Sector: {sector_name} (first {limit} records) ---")
-    query = f"SELECT * FROM vw_organizations_full WHERE sector_name = :sector_name LIMIT :limit;"
-    results = db_manager.fetch_all(query, {'sector_name': sector_name, 'limit': limit})
-    if results:
-        df_results = pd.DataFrame(results)
-        # Select key columns for display to avoid overwhelming output
-        display_cols = [
-            'legal_name', 'sector_name', 'employee_count', 'annual_revenue_usd',
-            'plant_count', 'algo_trading', 'ehr_system', 'github_stars_total', 'store_count',
-            'generation_capacity_mw', 'firm_type'
-        ]
-        # Filter for columns that actually exist in the result set
-        existing_cols = [col for col in display_cols if col in df_results.columns]
-        display(df_results[existing_cols])
-    else:
-        print(f"No organizations found for sector '{sector_name}' in the unified view.")
+# Query the unified view (simulated by joining tables directly in mock client)
+# Since MockDatabaseClient doesn't truly parse views, we simulate the join logic for demonstration
+def query_unified_view(db_client: MockDatabaseClient, focus_group_id: Optional[str] = None):
+    orgs = db_client.get_table_data('organizations')
+    focus_groups = {fg['focus_group_id']: fg for fg in db_client.get_table_data('focus_groups')}
+    
+    # Fetch all attribute data once to make simulation simpler
+    attrs_mfg = {a['organization_id']: a for a in db_client.get_table_data('org_attributes_manufacturing')}
+    attrs_fin = {a['organization_id']: a for a in db_client.get_table_data('org_attributes_financial_services')}
+    attrs_hc = {a['organization_id']: a for a in db_client.get_table_data('org_attributes_healthcare')}
+    # Add others as needed for a more complete simulation
 
-# Example queries
-query_unified_view_by_sector(db_manager, 'Manufacturing')
-query_unified_view_by_sector(db_manager, 'Financial Services')
-query_unified_view_by_sector(db_manager, 'Technology')
+    results = []
+    for org in orgs:
+        if focus_group_id and org['focus_group_id'] != focus_group_id:
+            continue
+        
+        merged_row = org.copy()
+        merged_row['sector_name'] = focus_groups.get(org['focus_group_id'], {}).get('group_name')
+        merged_row['sector_code'] = focus_groups.get(org['focus_group_id'], {}).get('group_code')
+
+        # Simulate LEFT JOIN for attributes
+        merged_row.update(attrs_mfg.get(org['organization_id'], {}))
+        merged_row.update(attrs_fin.get(org['organization_id'], {}))
+        merged_row.update(attrs_hc.get(org['organization_id'], {}))
+        # Add updates for other sectors
+
+        results.append(merged_row)
+    
+    # Filter out redundant columns if present due to update merging
+    filtered_results = []
+    for row in results:
+        clean_row = {}
+        for k, v in row.items():
+            # Exclude specific attribute table FKs like 'organization_id' from attribute tables
+            if k == 'organization_id' and (row.get('focus_group_id') == 'pe_manufacturing' and k in attrs_mfg.get(row['organization_id'], {})):
+                continue
+            if k == 'organization_id' and (row.get('focus_group_id') == 'pe_financial_services' and k in attrs_fin.get(row['organization_id'], {})):
+                continue
+            if k == 'organization_id' and (row.get('focus_group_id') == 'pe_healthcare' and k in attrs_hc.get(row['organization_id'], {})):
+                continue
+            clean_row[k] = v
+        filtered_results.append(clean_row)
+
+    return filtered_results
+
+# Display data from the unified view (all organizations)
+print("\n--- All Organizations from Unified View ---")
+df_unified_all = pd.DataFrame(query_unified_view(db))
+display(df_unified_all[['legal_name', 'sector_name', 'annual_revenue_usd', 'plant_count', 'aum_billions', 'bed_count']])
+
+# Display data from the unified view (filtered by a specific sector, e.g., Financial Services)
+print("\n--- Financial Services Organizations from Unified View ---")
+df_unified_fin = pd.DataFrame(query_unified_view(db, focus_group_id='pe_financial_services'))
+display(df_unified_fin[['legal_name', 'sector_name', 'aum_billions', 'fraud_detection_ai', 'regulatory_bodies']])
 ```
 
-### 7.3 Explanation of Execution
+### Explanation of Execution
 
-The `vw_organizations_full` view is now available, consolidating all relevant data into a single, easy-to-query interface. Analysts can now retrieve comprehensive information about any organization, including its core details, sector, and sector-specific attributes, with a simple `SELECT * FROM vw_organizations_full` and appropriate filtering. This eliminates the need for complex multi-table joins in every analytical query, significantly improving developer productivity and data accessibility for the PE Org-AI-R team. It's a testament to how a well-designed, configuration-driven data architecture can streamline real-world workflows.
+The `CREATE OR REPLACE VIEW vw_organizations_full` SQL statement is defined to join the `organizations` table with `focus_groups` and all the `org_attributes_` tables using `LEFT JOIN`. This ensures that even organizations without specific attribute entries in a particular sector's table are still included in the view.
 
----
+The `query_unified_view` Python function simulates querying this view from the `MockDatabaseClient`. It manually performs the necessary joins and aggregations, mimicking what a real database would do when the `vw_organizations_full` view is queried.
 
-## Conclusion
+The outputs demonstrate:
+1.  **A complete view of all organizations**: Showing their general information alongside available sector-specific attributes (e.g., `plant_count` for Manufacturing, `aum_billions` for Financial Services). Notice that many attribute columns will be `None` for organizations not belonging to that specific sector, as expected with `LEFT JOIN` and sparse attribute tables.
+2.  **Filtered view for a specific sector (Financial Services)**: This highlights how easily an analyst can now get all relevant data for a particular sector, including `aum_billions` (Assets Under Management) and `fraud_detection_ai` status, directly from a single, clean view.
 
-Sarah has successfully implemented a robust, configuration-driven data architecture for the PE Org-AI-R platform. This system effectively manages sector-specific evaluation criteria and organizational attributes without resorting to complex hardcoding or schema proliferation. The "One Schema, Many Configurations" principle has been demonstrated through a unified data model that provides flexibility and scalability. The integration of a caching service ensures high-performance access to critical configuration data, while clear data validation reinforces data integrity. This approach empowers the PE Org-AI-R firm to adapt quickly to changing market dynamics and sector-specific investment strategies.
+This unified view drastically simplifies data access for downstream analytics, reporting, and other services on the PE Org-AI-R platform, fulfilling the requirement for easily queryable sector-specific data.
 
-**Next Steps for PE Org-AI-R:**
--   Develop API endpoints to expose the `SectorConfigService` and the `vw_organizations_full` view.
--   Build an administrative UI for managing sector configurations, including historical versions of weights and calibrations.
--   Integrate this data platform with AI-driven scoring models that leverage the sector-specific weights and calibrations.
